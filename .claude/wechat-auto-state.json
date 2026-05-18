@@ -1,0 +1,24 @@
+{
+  "messageStates": {
+    "msg:7462011359526888000": {
+      "status": "replied",
+      "failCount": 0,
+      "lastAttemptAt": "2026-05-18T05:29:26.410Z",
+      "originalText": "[OK]",
+      "fromUserId": "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat",
+      "contextToken": "AARzJWAFAAABAAAAAAA4NfLfDcuOJviMoaMKaiAAAAB+9905Q6UiugPBawU3n3cyzQX+LkN8ofRzsCZYN0mt7rvKSwsu4jHP/7BXOvbtmW81WF8whUIoRyJ35vqX+NDmxeLjHRfK",
+      "receivedAt": "2026-05-18T05:29:05.485Z"
+    },
+    "msg:7462011529719172000": {
+      "status": "replied",
+      "failCount": 0,
+      "lastAttemptAt": "2026-05-18T05:29:57.200Z",
+      "originalText": "[文件: 1342308006480262771.pdf]",
+      "fromUserId": "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat",
+      "contextToken": "AARzJWAFAAABAAAAAADvb/RDCdKx2zUMyqMKaiAAAAB+9905Q6UiugPBawU3n3cyzQX+LkN8ofRzsCZYN0mt7nH7dMi9TwRJ646YYhPkM2AI4//NDEHU7GW4A9vQABcSTMchnnHA",
+      "receivedAt": "2026-05-18T05:29:45.991Z"
+    }
+  },
+  "deadLetterIds": [],
+  "lastStartedAt": "2026-05-18T05:05:39.236Z"
+}
