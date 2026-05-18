@@ -404,22 +404,40 @@ async function main() {
 
   // No args (double-click): launch system tray and exit
   if (args.length === 0) {
-    const trayExe = join(PROJ, ".claude", "hooks", "wechat-tray.exe");
-    if (!existsSync(trayExe)) {
-      log("Tray exe not found, falling back to console mode");
-      log("Compile it: \"$env:windir\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe\" /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:.claude\\hooks\\wechat-tray.exe .claude\\hooks\\wechat-tray.cs");
-      // Fall through to console mode
+    if (platform.isWindows()) {
+      const trayExe = join(PROJ, ".claude", "hooks", "wechat-tray.exe");
+      if (!existsSync(trayExe)) {
+        log("Tray exe not found, falling back to console mode");
+        log("Compile it: \"$env:windir\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe\" /nologo /target:winexe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:.claude\\hooks\\wechat-tray.exe .claude\\hooks\\wechat-tray.cs");
+        // Fall through to console mode
+      } else {
+        log("Starting in tray mode (background + notification icon)...");
+        const child = spawn(trayExe, ["-ProjectRoot", PROJ], {
+          cwd: PROJ,
+          stdio: "ignore",
+          windowsHide: true,
+          detached: true,
+        });
+        child.unref();
+        log("Tray mode active, this window will close now.");
+        process.exit(0);
+      }
     } else {
-      log("Starting in tray mode (background + notification icon)...");
-      const child = spawn(trayExe, ["-ProjectRoot", PROJ], {
-        cwd: PROJ,
-        stdio: "ignore",
-        windowsHide: true,
-        detached: true,
-      });
-      child.unref();
-      log("Tray mode active, this window will close now.");
-      process.exit(0);
+      // Linux GTK tray
+      const trayPy = join(PROJ, ".claude", "hooks", "wechat-tray.py");
+      if (!existsSync(trayPy)) {
+        log("Tray py not found, falling back to console mode");
+      } else {
+        log("Starting in Linux tray mode...");
+        const child = spawn("python3", [trayPy, "-ProjectRoot", PROJ], {
+          cwd: PROJ,
+          stdio: "ignore",
+          detached: true,
+        });
+        child.unref();
+        log("Tray mode active, this window will close now.");
+        process.exit(0);
+      }
     }
   }
 
