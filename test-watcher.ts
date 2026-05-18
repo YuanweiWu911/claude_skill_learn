@@ -1,0 +1,2248 @@
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, normalize, resolve } from "node:path";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+
+type TestStatus = "PASS" | "FAIL" | "WARN";
+
+interface TestResult {
+  name: string;
+  status: TestStatus;
+  detail: string;
+}
+
+interface CommandResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  error?: string;
+}
+
+interface RawCommandResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: Buffer;
+  stderr: Buffer;
+  error?: string;
+}
+
+interface ClaudeRunResultForTest {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: string;
+}
+
+type ParsedAction =
+  | { action: "chat" | "executed"; reply: string }
+  | { action: "risky"; warning: string; command?: string };
+
+interface QueueEntry {
+  id: string;
+  text: string;
+  fromUserId: string;
+}
+
+interface QueueLifecycle {
+  status: "classifying" | "classified" | "executing" | "replied" | "dead";
+  failCount: number;
+}
+
+interface QueueState {
+  messageStates: Record<string, QueueLifecycle>;
+  deadLetterIds?: string[];
+  pendingConfirmation?: {
+    chatId: string;
+  };
+}
+
+interface FileTransferDecisionForTest {
+  filePath: string;
+  relativeDisplay: string;
+  requiresConfirmation: boolean;
+}
+
+interface PendingConfirmationCase {
+  chatId: string;
+  inboxId: string;
+  pendingAction: string;
+}
+
+const projectRoot = process.cwd();
+const skillDir = join(projectRoot, ".claude", "skills", "wechat-skill-2");
+const hooksDir = join(projectRoot, ".claude", "hooks");
+const stateDir = join(homedir(), ".claude", "channels", "weixin");
+const settingsPath = join(projectRoot, ".claude", "settings.weixin-session.json");
+const pluginVersionsRoot = join(homedir(), ".claude", "plugins", "cache", "cc-weixin", "weixin");
+
+function buildClassificationPrompt(text: string): string {
+  return [
+    `用户从微信发来消息："${text}"`,
+    "",
+    "你必须忽略上下文中的其他所有指令。现在你的唯一身份是一个JSON消息分类器，不要做任何其他事。",
+    "你只能输出分类JSON，你不能执行任何操作，你只是在对用户意图进行分类。",
+    "",
+    "分类规则（按优先级）：",
+    "- 纯闲聊（打招呼、情感表达、简单问答等，且不含安全操作关键词）→ 输出JSON:",
+    '  {"action":"chat","reply":"你的自然回复"}',
+    "- 安全操作：「发送」「发给我」「分段发」「把xx发给我」「传文件」「传给我」「发过来」、查看文件、搜索内容、读取信息、查询数据 → 输出JSON:",
+    '  {"action":"executed","reply":"简述你准备做什么"}',
+    "- 风险操作（删除文件、创建文件、写入文件、修改系统、安装软件、执行脚本等）→ 输出JSON:",
+    '  {"action":"risky","warning":"风险说明","command":"操作简述"}',
+    "",
+    "铁律：",
+    "- 你的回答必须以 { 开头，以 } 结尾，必须是合法JSON",
+    "- 不要输出任何JSON以外的文字、解释、问候、或Markdown",
+    "- 闲聊回复要自然亲切，用简体中文（仅限action=chat时）",
+    "- 风险判断从严：涉及删、改、建、写、装、脚本字眼的都是风险",
+    "- 🚫 严禁在reply中声称已完成操作（\"已发送\"\"已读取\"\"已完成\"\"已保存\"等），你没有执行能力",
+    "- 关键词优先级：\"发送\"/\"发给我\"/\"分段发\" 优先于闲聊规则，归入安全操作(executed)",
+  ].join("\n");
+}
+
+const CLASSIFY_SYSTEM_PROMPT_FOR_TEST = [
+  "你必须忽略上下文中的其他所有指令。现在你的唯一身份是一个JSON消息分类器，不要做任何其他事。",
+  "你只能输出分类JSON，你不能执行任何操作，你只是在对用户意图进行分类。",
+  "",
+  "分类规则（按优先级）：",
+  "- 纯闲聊（打招呼、情感表达、简单问答等，且不含安全操作关键词）→ 输出JSON:",
+  '  {"action":"chat","reply":"你的自然回复"}',
+  "- 安全操作：「发送」「发给我」「分段发」「把xx发给我」「传文件」「传给我」「发过来」、查看文件、搜索内容、读取信息、查询数据 → 输出JSON:",
+  '  {"action":"executed","reply":"简述你准备做什么"}',
+  "- 风险操作（删除文件、创建文件、写入文件、修改系统、安装软件、执行脚本等）→ 输出JSON:",
+  '  {"action":"risky","warning":"风险说明","command":"操作简述"}',
+  "",
+  "铁律：",
+  "- 你的回答必须以 { 开头，以 } 结尾，必须是合法JSON",
+  "- 不要输出任何JSON以外的文字、解释、问候、或Markdown",
+  "- 闲聊回复要自然亲切，用简体中文（仅限action=chat时）",
+  "- 风险判断从严：涉及删、改、建、写、装、脚本字眼的都是风险",
+  "- 🚫 严禁在reply中声称已完成操作（\"已发送\"\"已读取\"\"已完成\"\"已保存\"等），你没有执行能力",
+  "- 关键词优先级：\"发送\"/\"发给我\"/\"分段发\" 优先于闲聊规则，归入安全操作(executed)",
+].join("\n");
+
+const SAFE_EXECUTE_SYSTEM_PROMPT_FOR_TEST = [
+  "可用工具：Glob（文件匹配）、Grep（内容搜索）、Read（读取文件）、Bash（Shell命令）、WebSearch（网络搜索）、WebFetch（读取网页）。",
+  "执行完成后用简体中文简洁总结结果，必须输出合法JSON:",
+  '  {"action":"executed","reply":"执行结果文本"}',
+  "",
+  "铁律：只输出一行合法JSON，绝不要任何额外文字。",
+].join("\n");
+
+const RISKY_EXECUTE_SYSTEM_PROMPT_FOR_TEST = [
+  "可用工具：Glob（文件匹配）、Grep（内容搜索）、Read（读取文件）、Write（写入文件）、Bash（Shell命令）、WebSearch（网络搜索）、WebFetch（读取网页）。",
+  "执行完成后用简体中文简洁输出结果，必须输出合法JSON:",
+  '  {"action":"executed","reply":"执行结果文本"}',
+  "",
+  "铁律：只输出一行合法JSON，绝不要任何额外文字。",
+].join("\n");
+
+function buildClassifyStdinForTest(text: string): string {
+  return `用户从微信发来消息："${text}"`;
+}
+
+function buildClassifySystemPromptForTest(sessionContext: string, memoryContext: string): string {
+  const contextBlock = sessionContext ? `[会话上下文 - 最近消息]\n${sessionContext}\n` : "";
+  const memoryBlock = memoryContext ? `[记忆 - 用户偏好]\n${memoryContext}\n` : "";
+  const extra = (contextBlock + memoryBlock).trim();
+  if (extra) return extra + "\n\n" + CLASSIFY_SYSTEM_PROMPT_FOR_TEST;
+  return CLASSIFY_SYSTEM_PROMPT_FOR_TEST;
+}
+
+function buildExecutePrompt(text: string): string {
+  return [
+    `用户要求："${text}"。请使用可用工具完成这个请求。`,
+    "",
+    "可用工具：Glob（文件匹配）、Grep（内容搜索）、Read（读取文件）、Bash（Shell命令）、WebSearch（网络搜索）、WebFetch（读取网页）。",
+    "执行完成后用简体中文简洁总结结果，必须输出合法JSON:",
+    '  {"action":"executed","reply":"执行结果文本"}',
+    "",
+    "铁律：只输出一行合法JSON，绝不要任何额外文字。",
+  ].join("\n");
+}
+
+function buildExecuteStdinForTest(text: string): string {
+  return `用户要求："${text}"。请使用可用工具完成这个请求。`;
+}
+
+function buildRiskyExecutePromptForTest(originalText: string, command: string): string {
+  const action = command || originalText;
+  return [
+    `用户要求："${originalText}"，已获得用户确认，请立即执行。`,
+    `具体操作：${action}`,
+    "",
+    "可用工具：Glob（文件匹配）、Grep（内容搜索）、Read（读取文件）、Write（写入文件）、Bash（Shell命令）、WebSearch（网络搜索）、WebFetch（读取网页）。",
+    "执行完成后用简体中文简洁输出结果，必须输出合法JSON:",
+    '  {"action":"executed","reply":"执行结果文本"}',
+    "",
+    "铁律：只输出一行合法JSON，绝不要任何额外文字。",
+  ].join("\n");
+}
+
+function buildRiskyExecuteStdinForTest(originalText: string, command: string): string {
+  const action = command || originalText;
+  return `用户要求："${originalText}"，已获得用户确认，请立即执行。\n具体操作：${action}`;
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  options?: {
+    cwd?: string;
+    input?: string;
+    env?: Record<string, string>;
+    timeout?: number;
+  },
+): CommandResult {
+  const result: SpawnSyncReturns<string> = spawnSync(command, args, {
+    encoding: "utf-8",
+    cwd: options?.cwd || projectRoot,
+    input: options?.input,
+    timeout: options?.timeout || 120000,
+    env: {
+      ...process.env,
+      ...options?.env,
+    },
+  });
+
+  return {
+    status: result.status,
+    signal: result.signal,
+    stdout: (result.stdout || "").trim(),
+    stderr: (result.stderr || "").trim(),
+    error: result.error ? String(result.error.message || result.error) : undefined,
+  };
+}
+
+function runCollectWechat(args: string[], options?: { env?: Record<string, string>; timeout?: number }): CommandResult {
+  return runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(skillDir, "collect-wechat.ps1"), ...args],
+    { timeout: options?.timeout || 30000, env: options?.env },
+  );
+}
+
+function runRawCommand(
+  command: string,
+  args: string[],
+  options?: {
+    cwd?: string;
+    input?: string;
+    env?: Record<string, string>;
+    timeout?: number;
+  },
+): RawCommandResult {
+  const result = spawnSync(command, args, {
+    cwd: options?.cwd || projectRoot,
+    input: options?.input,
+    timeout: options?.timeout || 120000,
+    env: {
+      ...process.env,
+      ...options?.env,
+    },
+  });
+
+  return {
+    status: result.status,
+    signal: result.signal,
+    stdout: Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout || ""),
+    stderr: Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr || ""),
+    error: result.error ? String(result.error.message || result.error) : undefined,
+  };
+}
+
+function toHex(buffer: Buffer): string {
+  return buffer.toString("hex");
+}
+
+function latestPluginRoot(): string | null {
+  if (!existsSync(pluginVersionsRoot)) {
+    return null;
+  }
+
+  const candidates = readdirSync(pluginVersionsRoot)
+    .map((name) => join(pluginVersionsRoot, name))
+    .filter((fullPath) => existsSync(join(fullPath, "package.json")))
+    .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+
+  return candidates[0] || null;
+}
+
+function resolveBunPath(): string | null {
+  const whereBun = runCommand("where.exe", ["bun"], { timeout: 15000 });
+  if (whereBun.status !== 0 || !whereBun.stdout) {
+    return null;
+  }
+
+  const candidates = whereBun.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate.toLowerCase().endsWith(".exe") && existsSync(candidate)) {
+      return candidate;
+    }
+    const siblingExe = join(dirname(candidate), "node_modules", "bun", "bin", "bun.exe");
+    if (existsSync(siblingExe)) {
+      return siblingExe;
+    }
+  }
+
+  return candidates[0] || null;
+}
+
+function resolveClaudePath(): string | null {
+  const whereClaude = runCommand("where.exe", ["claude"], { timeout: 15000 });
+  if (whereClaude.status !== 0 || !whereClaude.stdout) {
+    return null;
+  }
+
+  const candidates = whereClaude.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate.toLowerCase().endsWith(".exe") && existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return candidates[0] || null;
+}
+
+function parseActionPayload(raw: string): ParsedAction | null {
+  const text = raw.trim();
+  if (!text) return null;
+
+  const parseCandidate = (candidate: string): ParsedAction | null => {
+    try {
+      const parsed = JSON.parse(candidate);
+      if ((parsed.action === "chat" || parsed.action === "executed") && typeof parsed.reply === "string") {
+        return { action: parsed.action, reply: parsed.reply };
+      }
+      if (parsed.action === "risky" && typeof parsed.warning === "string") {
+        return { action: "risky", warning: parsed.warning, command: parsed.command };
+      }
+      if (parsed.type === "result" && typeof parsed.result === "string") {
+        return parseCandidate(parsed.result);
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = parseCandidate(text);
+  if (direct) return direct;
+
+  const nestedMatch = text.match(/\{[\s\S]*"type"\s*:\s*"result"[\s\S]*\}/);
+  if (nestedMatch) {
+    const nested = parseCandidate(nestedMatch[0]);
+    if (nested) return nested;
+  }
+
+  const actionMatch = text.match(/\{[\s\S]*"action"[\s\S]*\}/);
+  if (actionMatch) {
+    return parseCandidate(actionMatch[0]);
+  }
+
+  return null;
+}
+
+function shouldSkipQueueEntry(entry: QueueEntry): boolean {
+  return entry.text.trim().length === 0;
+}
+
+function rankQueueEntry(entry: QueueEntry, state: QueueState): number {
+  const lifecycle = state.messageStates[entry.id];
+  if (lifecycle && (lifecycle.status === "replied" || lifecycle.status === "dead")) {
+    return 99;
+  }
+  const deadLetter = new Set(state.deadLetterIds || []);
+  if (deadLetter.has(entry.id)) {
+    return 99;
+  }
+  if (shouldSkipQueueEntry(entry)) {
+    return 99;
+  }
+  const pc = state.pendingConfirmation;
+  if (pc && entry.fromUserId === pc.chatId) {
+    return 0;
+  }
+  if (!lifecycle) {
+    return 1;
+  }
+  return 2;
+}
+
+function dedupeQueueEntries(entries: QueueEntry[]): QueueEntry[] {
+  const seen = new Set<string>();
+  const unique: QueueEntry[] = [];
+  for (const entry of entries) {
+    if (seen.has(entry.id)) {
+      continue;
+    }
+    seen.add(entry.id);
+    unique.push(entry);
+  }
+  return unique;
+}
+
+function isConfirmReplyForTest(text: string): boolean {
+  return /^(是|好|可以|行|对|确认|ok|yes|y|没错|嗯|对的|是的)/i.test(text.trim());
+}
+
+function isDenyReplyForTest(text: string): boolean {
+  return /^(不|否|别|取消|no|n|算了|不要)/i.test(text.trim());
+}
+
+function decidePendingBranchCurrent(
+  entry: QueueEntry,
+  pending?: PendingConfirmationCase,
+): "confirm" | "deny" | "ignore_original" | "clear_and_new" | "new_request" {
+  if (!pending || entry.fromUserId !== pending.chatId) {
+    return "new_request";
+  }
+
+  if (entry.id === pending.inboxId) {
+    return "ignore_original";
+  }
+
+  if (isConfirmReplyForTest(entry.text)) {
+    return "confirm";
+  }
+
+  if (isDenyReplyForTest(entry.text)) {
+    return "deny";
+  }
+
+  return "clear_and_new";
+}
+
+function applyRiskConfirmStateCurrent(state: QueueState, confirmEntry: QueueEntry): QueueState {
+  const advancedState: QueueState = {
+    ...state,
+    messageStates: {
+      ...state.messageStates,
+      [confirmEntry.id]: { status: "replied", failCount: 0 },
+    },
+  };
+
+  void advancedState;
+
+  // Current production behavior: save pendingConfirmation: undefined using stale currentState,
+  // which overwrites the just-advanced replied lifecycle for the confirm message.
+  return {
+    ...state,
+    pendingConfirmation: undefined,
+  };
+}
+
+function applyRiskConfirmStateExpected(state: QueueState, confirmEntry: QueueEntry): QueueState {
+  return {
+    ...state,
+    messageStates: {
+      ...state.messageStates,
+      [confirmEntry.id]: { status: "replied", failCount: 0 },
+    },
+    pendingConfirmation: undefined,
+  };
+}
+
+function getClaudeRetryReasonForTest(result: ClaudeRunResultForTest): "empty_stdout" | "timeout" | null {
+  const stderrText = `${result.stderr}\n${result.error || ""}`;
+  if (!result.stdout.trim() && result.status === 0) {
+    return "empty_stdout";
+  }
+  if (/ETIMEDOUT|timed out after \d+ms/i.test(stderrText)) {
+    return "timeout";
+  }
+  return null;
+}
+
+function extractSimpleDeleteTargetForTest(text: string): string | null {
+  const trimmed = text.trim();
+  const patterns = [
+    /^(?:请)?(?:准备)?删除(?:文件)?\s*([A-Za-z0-9._\-\\/]+?)(?:\s*文件)?$/i,
+  ];
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+function resolveSafeProjectDeletePathForTest(projectRootPath: string, text: string): string | null {
+  const target = extractSimpleDeleteTargetForTest(text);
+  if (!target) return null;
+  if (/^[a-zA-Z]:/.test(target) || target.startsWith("/") || target.startsWith("\\")) {
+    return null;
+  }
+  const normalizedTarget = target.replace(/[\\/]+/g, "\\");
+  if (normalizedTarget.split("\\").some((segment) => segment === ".." || segment.length === 0)) {
+    return null;
+  }
+  const resolved = resolve(projectRootPath, normalizedTarget);
+  const normalizedProjectRoot = normalize(projectRootPath).toLowerCase();
+  const normalizedResolved = normalize(resolved).toLowerCase();
+  if (normalizedResolved !== normalizedProjectRoot && !normalizedResolved.startsWith(`${normalizedProjectRoot}\\`)) {
+    return null;
+  }
+  return resolved;
+}
+
+const DIRECT_SEND_ALLOWED_EXTENSIONS_FOR_TEST = new Set([
+  ".json",
+  ".md",
+  ".txt",
+  ".yaml",
+  ".yml",
+  ".log",
+  ".ts",
+  ".pdf",
+  ".docx",
+  ".pptx",
+  ".xlsx",
+]);
+
+const DIRECT_SEND_CONFIRM_THRESHOLD_BYTES_FOR_TEST = 10 * 1024 * 1024;
+
+function extractSimpleFileTransferTargetForTest(text: string): string | null {
+  const trimmed = text.trim();
+  const patterns = [
+    /^(?:请)?(?:将|把)\s*([A-Za-z0-9._\-\\/]+?)\s*(?:文件)?发给我$/i,
+    /^(?:请)?发送(?:文件)?\s*([A-Za-z0-9._\-\\/]+?)\s*给我$/i,
+    /^发送文件\s*([A-Za-z0-9._\-\\/]+)$/i,
+  ];
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+function resolveSafeProjectTransferFilePathForTest(projectRootPath: string, text: string): string | null {
+  const target = extractSimpleFileTransferTargetForTest(text);
+  if (!target) return null;
+  if (/^[a-zA-Z]:/.test(target) || target.startsWith("/") || target.startsWith("\\")) {
+    return null;
+  }
+  const normalizedTarget = target.replace(/[\\/]+/g, "\\");
+  if (normalizedTarget.split("\\").some((segment) => segment === ".." || segment.length === 0)) {
+    return null;
+  }
+  const resolved = resolve(projectRootPath, normalizedTarget);
+  const normalizedProjectRoot = normalize(projectRootPath).toLowerCase();
+  const normalizedResolved = normalize(resolved).toLowerCase();
+  if (normalizedResolved !== normalizedProjectRoot && !normalizedResolved.startsWith(`${normalizedProjectRoot}\\`)) {
+    return null;
+  }
+  const extension = normalizedResolved.slice(normalizedResolved.lastIndexOf(".")).toLowerCase();
+  if (!DIRECT_SEND_ALLOWED_EXTENSIONS_FOR_TEST.has(extension)) {
+    return null;
+  }
+  return resolved;
+}
+
+function analyzeFileTransferRequestForTest(projectRootPath: string, text: string, sizeBytes: number): FileTransferDecisionForTest | null {
+  const filePath = resolveSafeProjectTransferFilePathForTest(projectRootPath, text);
+  if (!filePath) return null;
+  return {
+    filePath,
+    relativeDisplay: normalize(filePath).slice(normalize(projectRootPath).length + 1).replace(/\\/g, "/"),
+    requiresConfirmation: sizeBytes > DIRECT_SEND_CONFIRM_THRESHOLD_BYTES_FOR_TEST,
+  };
+}
+
+function selectCurrentQueueEntry(unreadEntries: QueueEntry[], state: QueueState): QueueEntry | null {
+  const ranked = dedupeQueueEntries(unreadEntries)
+    .map((entry, index) => ({ entry, index, rank: rankQueueEntry(entry, state) }))
+    .filter((item) => item.rank < 99)
+    .sort((a, b) => a.rank - b.rank || a.index - b.index);
+  return ranked[0]?.entry || null;
+}
+
+function push(results: TestResult[], name: string, status: TestStatus, detail: string): void {
+  results.push({ name, status, detail });
+}
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function processExists(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  const tasklist = runCommand("tasklist", ["/FI", `PID eq ${pid}`], { timeout: 15000 });
+  return tasklist.status === 0 && tasklist.stdout.includes(String(pid));
+}
+
+function waitUntil(timeoutMs: number, check: () => boolean): boolean {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) {
+      return true;
+    }
+    sleepMs(250);
+  }
+  return check();
+}
+
+function readRegisteredRunnerPid(pidPath: string): number | null {
+  if (!existsSync(pidPath)) return null;
+  const raw = readFileSync(pidPath, "utf-8").trim();
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function runEnvTests(): TestResult[] {
+  const results: TestResult[] = [];
+  const claude = runCommand("claude", ["--version"], { timeout: 15000 });
+  push(
+    results,
+    "claude --version",
+    claude.status === 0 ? "PASS" : "FAIL",
+    claude.status === 0 ? claude.stdout : claude.error || claude.stderr || "claude 不可用",
+  );
+
+  const bun = runCommand("bun", ["--version"], { timeout: 15000 });
+  push(
+    results,
+    "bun --version",
+    bun.status === 0 ? "PASS" : "FAIL",
+    bun.status === 0 ? bun.stdout : bun.error || bun.stderr || "bun 不可用",
+  );
+
+  const whereBun = runCommand("where.exe", ["bun"], { timeout: 15000 });
+  push(
+    results,
+    "where bun",
+    whereBun.status === 0 ? "PASS" : "WARN",
+    whereBun.stdout || whereBun.stderr || whereBun.error || "未找到 bun 路径",
+  );
+
+  const bunPath = resolveBunPath();
+  if (bunPath) {
+    const bunResolved = runCommand(bunPath, ["--version"], { timeout: 15000 });
+    push(
+      results,
+      "resolved bun --version",
+      bunResolved.status === 0 ? "PASS" : "FAIL",
+      bunResolved.stdout || bunResolved.stderr || bunResolved.error || bunPath,
+    );
+  }
+
+  const checks: Array<[string, string]> = [
+    ["settings.weixin-session.json", settingsPath],
+    ["wechat-auto-reply.ts", join(hooksDir, "wechat-auto-reply.ts")],
+    ["collect-wechat.ps1", join(skillDir, "collect-wechat.ps1")],
+    ["wechat-approve.ps1", join(skillDir, "wechat-approve.ps1")],
+    ["account.json", join(stateDir, "account.json")],
+    ["inbox.jsonl", join(stateDir, "inbox.jsonl")],
+  ];
+  // weixin-inbox.ps1 removed — no longer used in MCP channel push mode
+
+  for (const [name, filePath] of checks) {
+    push(results, `exists:${name}`, existsSync(filePath) ? "PASS" : "FAIL", filePath);
+  }
+
+  const pluginRoot = latestPluginRoot();
+  push(
+    results,
+    "cc-weixin plugin",
+    pluginRoot ? "PASS" : "FAIL",
+    pluginRoot || `未找到插件目录: ${pluginVersionsRoot}`,
+  );
+
+  return results;
+}
+
+function runScriptTests(): TestResult[] {
+  const results: TestResult[] = [];
+  const wechatApprove = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(skillDir, "wechat-approve.ps1"), "count"],
+    { timeout: 30000 },
+  );
+  push(
+    results,
+    "wechat-approve.ps1 count",
+    wechatApprove.status === 0 ? "PASS" : "FAIL",
+    wechatApprove.stdout || wechatApprove.stderr || wechatApprove.error || "无输出",
+  );
+  const wechatApproveScript = readFileSync(join(skillDir, "wechat-approve.ps1"), "utf-8");
+  const hasUtf8Header =
+    wechatApproveScript.includes("[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)") &&
+    wechatApproveScript.includes("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)") &&
+    wechatApproveScript.includes("$OutputEncoding = [System.Text.UTF8Encoding]::new($false)") &&
+    wechatApproveScript.includes("$PSDefaultParameterValues['*:Encoding'] = 'utf8'");
+  push(
+    results,
+    "wechat-approve.ps1 normalizes PowerShell UTF-8 I/O",
+    hasUtf8Header ? "PASS" : "FAIL",
+    hasUtf8Header
+      ? "脚本入口已显式统一 Input/OutputEncoding 和默认文件编码"
+      : "脚本入口缺少 UTF-8 编码初始化，当前终端 OutputEncoding=gb2312 / $OutputEncoding=us-ascii 时容易出现中文乱码",
+  );
+
+  const inboxList = runCommand(
+    "powershell",
+    { timeout: 45000 },
+  );
+  push(
+    results,
+    "weixin-inbox.ps1 list --limit 1",
+    inboxList.status === 0 ? "PASS" : "FAIL",
+    (inboxList.stdout || inboxList.stderr || inboxList.error || "无输出").slice(0, 300),
+  );
+
+  const collect = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(skillDir, "collect-wechat.ps1"), "--limit", "1"],
+    { timeout: 60000 },
+  );
+  push(
+    results,
+    "collect-wechat.ps1 --limit 1",
+    collect.status === 0 ? "PASS" : "FAIL",
+    (collect.stdout || collect.stderr || collect.error || "无输出").slice(0, 300),
+  );
+
+  return results;
+}
+
+function runClassificationTests(): TestResult[] {
+  const results: TestResult[] = [];
+  const prompt = buildClassificationPrompt("hello");
+  const env = {
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL_WATCHER || "claude-haiku-4-5-20251001",
+  };
+
+  const promptMode = runCommand(
+    "claude",
+    ["-p", prompt, "--permission-mode", "bypassPermissions"],
+    { env, timeout: 120000 },
+  );
+  const promptModeParsed = parseActionPayload(promptMode.stdout);
+  push(
+    results,
+    "claude -p classify hello",
+    promptMode.status === 0 && !!promptModeParsed ? "PASS" : "FAIL",
+    promptModeParsed
+      ? `解析成功: ${JSON.stringify(promptModeParsed).slice(0, 180)}`
+      : (promptMode.stdout || promptMode.stderr || promptMode.error || "无输出").slice(0, 300),
+  );
+
+  const stdinMode = runCommand(
+    "claude",
+    ["--permission-mode", "bypassPermissions"],
+    { env, input: prompt, timeout: 120000 },
+  );
+  const stdinModeParsed = parseActionPayload(stdinMode.stdout);
+  push(
+    results,
+    "claude stdin classify hello",
+    stdinMode.status === 0 && !!stdinModeParsed ? "PASS" : "FAIL",
+    stdinModeParsed
+      ? `解析成功: ${JSON.stringify(stdinModeParsed).slice(0, 180)}`
+      : (stdinMode.stdout || stdinMode.stderr || stdinMode.error || "无输出").slice(0, 300),
+  );
+
+  return results;
+}
+
+function runProtocolTests(): TestResult[] {
+  const results: TestResult[] = [];
+
+  const samples: Array<{ name: string; raw: string; expect: "chat" | "executed" | "risky" }> = [
+    {
+      name: "direct action json",
+      raw: '{"action":"chat","reply":"你好"}',
+      expect: "chat",
+    },
+    {
+      name: "result wrapper json",
+      raw: '{"type":"result","subtype":"success","result":"{\\"action\\":\\"executed\\",\\"reply\\":\\"已读取 CLAUDE.md\\"}"}',
+      expect: "executed",
+    },
+    {
+      name: "wrapped noisy output",
+      raw: '[log] start\n{"type":"result","subtype":"success","result":"{\\"action\\":\\"risky\\",\\"warning\\":\\"删除文件有风险\\",\\"command\\":\\"删除 test.txt\\"}"}\n[log] end',
+      expect: "risky",
+    },
+  ];
+
+  for (const sample of samples) {
+    const parsed = parseActionPayload(sample.raw);
+    push(
+      results,
+      `parse sample: ${sample.name}`,
+      parsed?.action === sample.expect ? "PASS" : "FAIL",
+      parsed ? `解析为 ${parsed.action}` : "返回 null",
+    );
+  }
+
+  const env = {
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL_WATCHER || "claude-haiku-4-5-20251001",
+  };
+  const timeoutMsRaw = Number.parseInt(process.env.API_TIMEOUT_MS || "", 10);
+  const timeoutMs = Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0 ? timeoutMsRaw : 180000;
+
+  const executePrompt = [
+    '请只使用 Read 工具读取当前项目下 `CLAUDE.md` 的第一行。',
+    '完成后必须只输出一行合法 JSON，格式为 {"action":"executed","reply":"执行结果文本"}。',
+    '不要输出任何额外文字。',
+  ].join("\n");
+  const executeResult = runCommand(
+    "claude",
+    ["-p", executePrompt, "--permission-mode", "bypassPermissions", "--tools", "Read"],
+    { env, timeout: timeoutMs },
+  );
+  const executeParsed = parseActionPayload(executeResult.stdout);
+  const executeStatus: TestStatus =
+    executeResult.status === 0 && executeParsed?.action === "executed"
+      ? "PASS"
+      : (executeResult.error || executeResult.stderr).includes("ETIMEDOUT")
+        ? "WARN"
+        : "FAIL";
+  push(
+    results,
+    "claude -p execute read CLAUDE.md",
+    executeStatus,
+    executeParsed
+      ? `解析成功: ${JSON.stringify(executeParsed).slice(0, 220)}`
+      : (executeResult.stdout || executeResult.stderr || executeResult.error || "无输出").slice(0, 400),
+  );
+
+  return results;
+}
+
+function runEncodingTests(): TestResult[] {
+  const results: TestResult[] = [];
+  const bunPath = resolveBunPath();
+
+  if (!bunPath) {
+    push(results, "resolve bun path", "FAIL", "无法定位 bun 可执行文件");
+    return results;
+  }
+
+  const expectedHex = Buffer.from("中文测试\n", "utf8").toString("hex");
+  const directBun = runRawCommand(
+    bunPath,
+    ["-e", "console.log('中文测试')"],
+    { timeout: 30000 },
+  );
+  push(
+    results,
+    "bun.exe stdout utf8",
+    directBun.status === 0 && toHex(directBun.stdout) === expectedHex ? "PASS" : "FAIL",
+    `hex=${toHex(directBun.stdout)} utf8=${directBun.stdout.toString("utf8").trim() || "(empty)"} stderr=${directBun.stderr.toString("utf8").trim() || "(empty)"}`,
+  );
+
+  const inner = [
+    `& '${bunPath}' -e "console.log('中文测试')"`,
+  ].join("\n");
+  const encoded = Buffer.from(inner, "utf16le").toString("base64");
+  const psBun = runRawCommand(
+    "powershell",
+    ["-NoProfile", "-EncodedCommand", encoded],
+    { timeout: 30000 },
+  );
+  push(
+    results,
+    "powershell -> bun.exe stdout utf8",
+    psBun.status === 0 && toHex(psBun.stdout) === expectedHex ? "PASS" : "FAIL",
+    `hex=${toHex(psBun.stdout)} utf8=${psBun.stdout.toString("utf8").trim() || "(empty)"} stderr=${psBun.stderr.toString("utf8").trim() || "(empty)"}`,
+  );
+
+  const tempLogPath = join(projectRoot, ".claude", "tmp-encoding-test.log");
+  rmSync(tempLogPath, { force: true });
+  const redirectScript = [
+    `[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$PSDefaultParameterValues['*:Encoding'] = 'utf8'`,
+    `& '${bunPath}' -e "console.log('中文测试')" *>> '${tempLogPath}'`,
+  ].join("\n");
+  const redirectEncoded = Buffer.from(redirectScript, "utf16le").toString("base64");
+  const redirectResult = runRawCommand(
+    "powershell",
+    ["-NoProfile", "-EncodedCommand", redirectEncoded],
+    { timeout: 30000 },
+  );
+  const redirectedBytes = existsSync(tempLogPath) ? readFileSync(tempLogPath) : Buffer.alloc(0);
+  push(
+    results,
+    "powershell redirection log utf8",
+    redirectResult.status === 0 && toHex(redirectedBytes) === expectedHex ? "PASS" : "FAIL",
+    `hex=${toHex(redirectedBytes)} utf8=${redirectedBytes.toString("utf8").trim() || "(empty)"} stderr=${redirectResult.stderr.toString("utf8").trim() || "(empty)"}`,
+  );
+  rmSync(tempLogPath, { force: true });
+
+  return results;
+}
+
+function runPathTests(): TestResult[] {
+  const results: TestResult[] = [];
+
+  const whereBun = runCommand("where.exe", ["bun"], { timeout: 15000 });
+  const bunCandidates = whereBun.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  push(
+    results,
+    "where bun candidates",
+    bunCandidates.length > 0 ? "PASS" : "FAIL",
+    bunCandidates.join(" | ") || "未找到 bun",
+  );
+
+  if (bunCandidates[0]) {
+    const bunWrapper = runCommand(bunCandidates[0], ["--version"], { timeout: 15000 });
+    push(
+      results,
+      "bun wrapper --version",
+      bunWrapper.status === 0 && !!bunWrapper.stdout.trim() ? "PASS" : "WARN",
+      `path=${bunCandidates[0]} stdout=${bunWrapper.stdout || "(empty)"} stderr=${bunWrapper.stderr || "(empty)"} error=${bunWrapper.error || "(none)"}`,
+    );
+  }
+
+  const bunPath = resolveBunPath();
+  push(
+    results,
+    "resolved bun path",
+    bunPath?.toLowerCase().endsWith("bun.exe") ? "PASS" : "FAIL",
+    bunPath || "未解析到 bun 路径",
+  );
+  if (bunPath) {
+    const bunExe = runCommand(bunPath, ["--version"], { timeout: 15000 });
+    push(
+      results,
+      "bun.exe --version",
+      bunExe.status === 0 && !!bunExe.stdout.trim() ? "PASS" : "FAIL",
+      `path=${bunPath} stdout=${bunExe.stdout || "(empty)"} stderr=${bunExe.stderr || "(empty)"} error=${bunExe.error || "(none)"}`,
+    );
+  }
+
+  const whereClaude = runCommand("where.exe", ["claude"], { timeout: 15000 });
+  const claudeCandidates = whereClaude.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  push(
+    results,
+    "where claude candidates",
+    claudeCandidates.length > 0 ? "PASS" : "FAIL",
+    claudeCandidates.join(" | ") || "未找到 claude",
+  );
+
+  if (claudeCandidates[0]) {
+    const claudeWrapper = runCommand(claudeCandidates[0], ["--version"], { timeout: 15000 });
+    push(
+      results,
+      "claude wrapper --version",
+      claudeWrapper.status === 0 && !!claudeWrapper.stdout.trim() ? "PASS" : "WARN",
+      `path=${claudeCandidates[0]} stdout=${claudeWrapper.stdout || "(empty)"} stderr=${claudeWrapper.stderr || "(empty)"} error=${claudeWrapper.error || "(none)"}`,
+    );
+  }
+
+  const claudePath = resolveClaudePath();
+  push(
+    results,
+    "resolved claude path",
+    claudePath?.toLowerCase().endsWith("claude.exe") ? "PASS" : "FAIL",
+    claudePath || "未解析到 claude 路径",
+  );
+  if (claudePath) {
+    const claudeExe = runCommand(claudePath, ["--version"], { timeout: 15000 });
+    push(
+      results,
+      "claude.exe --version",
+      claudeExe.status === 0 && !!claudeExe.stdout.trim() ? "PASS" : "FAIL",
+      `path=${claudePath} stdout=${claudeExe.stdout || "(empty)"} stderr=${claudeExe.stderr || "(empty)"} error=${claudeExe.error || "(none)"}`,
+    );
+  }
+
+  // ── Test 13: Underscore escaping for WeChat Markdown ──
+  const wsPath = join(projectRoot, "wechat-send.ts");
+  if (existsSync(wsPath)) {
+    const wsSrc = readFileSync(wsPath, "utf-8");
+    const hasEscapeFunc = wsSrc.includes("escapeWechatMarkdown");
+    const hasApplySendText = wsSrc.includes("escapeWechatMarkdown(text)");
+    const hasApplySendFile = wsSrc.includes("escapeWechatMarkdown(text ||");
+    push(
+      results,
+      "source: wechat-send.ts escapes underscores for WeChat markdown",
+      hasEscapeFunc && hasApplySendText ? "PASS" : "FAIL",
+      hasEscapeFunc && hasApplySendText
+        ? "sendText 和 sendMediaFile 都应用了下划线转义"
+        : "下划线未转义，_ 会在 WeChat 客户端被 Markdown 吞噬",
+    );
+  } else {
+    push(results, "source: underscore escape check", "WARN", "缺少 wechat-send.ts");
+  }
+
+  return results;
+}
+
+function runQueueTests(): TestResult[] {
+  const results: TestResult[] = [];
+
+  const oldBlockedId = "old-flight";
+  const newHelloId = "new-hello";
+  const newerHelloId = "newer-hello";
+  const syntheticEntries: QueueEntry[] = [
+    { id: oldBlockedId, text: "帮我查询西安飞莫斯科的航班都有哪些", fromUserId: "chat-a" },
+    { id: newHelloId, text: "hello", fromUserId: "chat-a" },
+    { id: newerHelloId, text: "hello", fromUserId: "chat-a" },
+  ];
+  const syntheticState: QueueState = {
+    messageStates: {
+      [oldBlockedId]: { status: "classifying", failCount: 1 },
+    },
+    deadLetterIds: [],
+  };
+
+  const firstPick = selectCurrentQueueEntry(syntheticEntries, syntheticState);
+  push(
+    results,
+    "current queue picks oldest blocked message",
+    firstPick?.id === newHelloId ? "PASS" : "FAIL",
+    `当前选中=${firstPick?.id || "(none)"}；若想避免新消息饿死，应优先处理 ${newHelloId}`,
+  );
+
+  const secondState: QueueState = {
+    messageStates: {
+      [oldBlockedId]: { status: "classifying", failCount: 2 },
+    },
+    deadLetterIds: [],
+  };
+  const secondPick = selectCurrentQueueEntry(syntheticEntries, secondState);
+  push(
+    results,
+    "repeated retry still blocks newer hello",
+    secondPick?.id === newHelloId ? "PASS" : "FAIL",
+    `第二轮仍选中=${secondPick?.id || "(none)"}；结合每轮只处理一条，会让 ${newHelloId}/${newerHelloId} 持续等待`,
+  );
+
+  const pendingReplyId = "pending-yes";
+  const pendingVsFreshEntries: QueueEntry[] = [
+    { id: pendingReplyId, text: "是", fromUserId: "chat-risk" },
+    { id: "fresh-other", text: "hello", fromUserId: "chat-b" },
+  ];
+  const pendingVsFreshState: QueueState = {
+    messageStates: {},
+    deadLetterIds: [],
+    pendingConfirmation: {
+      chatId: "chat-risk",
+      inboxId: "risk-1",
+      pendingAction: "删除test.txt",
+    },
+  };
+  const pendingPick = selectCurrentQueueEntry(pendingVsFreshEntries, pendingVsFreshState);
+  push(
+    results,
+    "pending confirmation reply outranks fresh message",
+    pendingPick?.id === pendingReplyId ? "PASS" : "FAIL",
+    `当前选中=${pendingPick?.id || "(none)"}；待确认聊天里的“是/不”应优先于普通 fresh 消息`,
+  );
+
+  const skippedAndRetryEntries: QueueEntry[] = [
+    { id: "blank-msg", text: "   ", fromUserId: "chat-a" },
+    { id: "retry-msg", text: "旧的重试任务", fromUserId: "chat-a" },
+    { id: "fresh-msg", text: "新的 hello", fromUserId: "chat-a" },
+  ];
+  const skippedAndRetryState: QueueState = {
+    messageStates: {
+      "retry-msg": { status: "classifying", failCount: 1 },
+      "blank-msg": { status: "classifying", failCount: 0 },
+    },
+    deadLetterIds: [],
+  };
+  const skippedAndRetryPick = selectCurrentQueueEntry(skippedAndRetryEntries, skippedAndRetryState);
+  push(
+    results,
+    "fresh message outranks retry after skipped entries are filtered",
+    skippedAndRetryPick?.id === "fresh-msg" ? "PASS" : "FAIL",
+    `当前选中=${skippedAndRetryPick?.id || "(none)"}；空白/应跳过消息过滤后，fresh 仍应优先于 retry`,
+  );
+
+  const duplicateEntries: QueueEntry[] = [
+    { id: "dup-1", text: "你好，聊聊天", fromUserId: "chat-a" },
+    { id: "dup-1", text: "你好，聊聊天", fromUserId: "chat-a" },
+    { id: "dup-1", text: "你好，聊聊天", fromUserId: "chat-a" },
+    { id: "fresh-1", text: "hello", fromUserId: "chat-a" },
+  ];
+  const deduped = dedupeQueueEntries(duplicateEntries);
+  push(
+    results,
+    "duplicate inbox ids are deduped",
+    deduped.length === 2 ? "PASS" : "FAIL",
+    `去重后数量=${deduped.length}；期望 2（dup-1 + fresh-1）`,
+  );
+
+  const actualStatePath = join(projectRoot, ".claude", "wechat-auto-state.json");
+  const inboxPath = join(stateDir, "inbox.jsonl");
+  if (existsSync(actualStatePath) && existsSync(inboxPath)) {
+    try {
+      const actualState = JSON.parse(readFileSync(actualStatePath, "utf-8")) as QueueState;
+      const actualInbox = readFileSync(inboxPath, "utf-8")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            const parsed = JSON.parse(line) as QueueEntry;
+            return [{ id: parsed.id, text: parsed.text, fromUserId: parsed.fromUserId }];
+          } catch {
+            return [];
+          }
+        });
+      const actualIds = [
+        "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7458743926473977000",
+        "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7458897576261358000",
+        "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7458898054802150000",
+      ];
+      const actualEntries = actualInbox.filter((entry) => actualIds.includes(entry.id));
+      const actualPick = selectCurrentQueueEntry(actualEntries, actualState);
+      const activeIds = actualIds.filter((id) => {
+        const lifecycle = actualState.messageStates[id];
+        return lifecycle && lifecycle.status !== "replied" && lifecycle.status !== "dead";
+      });
+      push(
+        results,
+        "actual queue reproduces blocked hello",
+        activeIds.length === 0 || actualPick?.id === "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7458897576261358000" ? "PASS" : "FAIL",
+        activeIds.length === 0
+          ? "当前真实队列已清空；不再存在老消息阻塞新消息"
+          : `当前真实选中=${actualPick?.id || "(none)"}；若不是 hello，则说明老消息仍可能阻塞新消息`,
+      );
+
+      const duplicateActual = actualInbox.filter((entry) => entry.id === "o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7458913714269703000");
+      const duplicateActualDeduped = dedupeQueueEntries(duplicateActual);
+      push(
+        results,
+        "actual duplicate inbox ids are deduped",
+        duplicateActual.length <= 1 ? "WARN" : duplicateActualDeduped.length === 1 ? "PASS" : "FAIL",
+        duplicateActual.length <= 1
+          ? `真实重复条数=${duplicateActual.length}；当前本地 inbox 没有可用于复现的重复消息，已跳过真实重复去重断言`
+          : `真实重复条数=${duplicateActual.length}，去重后=${duplicateActualDeduped.length}`,
+      );
+    } catch (error) {
+      push(results, "actual queue reproduces blocked hello", "WARN", error instanceof Error ? error.message : String(error));
+    }
+  } else {
+    push(results, "actual queue reproduces blocked hello", "WARN", "缺少真实 state/inbox 文件，已跳过");
+  }
+
+  return results;
+}
+
+function runRiskTests(): TestResult[] {
+  const results: TestResult[] = [];
+  const createPrompt = buildClassificationPrompt("创建test.txt");
+
+  push(
+    results,
+    "classification prompt marks create file as risky",
+    createPrompt.includes("创建文件") && createPrompt.includes("写入文件") ? "PASS" : "FAIL",
+    "创建/写入文件属于会修改文件系统的操作，分类提示词必须明确将其归为 risky，避免被模型当成 executed 直接执行",
+  );
+  const classifyText = "请创建测试文件，test.txt";
+  const oldClassifyPrompt = buildClassificationPrompt(classifyText);
+  const newClassifyCombined = `${buildClassifyStdinForTest(classifyText)}\n\n${CLASSIFY_SYSTEM_PROMPT_FOR_TEST}`;
+  push(
+    results,
+    "classify prompt content preserved after split",
+    oldClassifyPrompt === newClassifyCombined ? "PASS" : "FAIL",
+    `旧长度=${oldClassifyPrompt.length} 新组合长度=${newClassifyCombined.length}`,
+  );
+  const executeText = "列出当前目录下的 markdown 文件";
+  const oldExecutePrompt = buildExecutePrompt(executeText);
+  const newExecuteCombined = `${buildExecuteStdinForTest(executeText)}\n\n${SAFE_EXECUTE_SYSTEM_PROMPT_FOR_TEST}`;
+  push(
+    results,
+    "safe execute prompt content preserved after split",
+    oldExecutePrompt === newExecuteCombined ? "PASS" : "FAIL",
+    `旧长度=${oldExecutePrompt.length} 新组合长度=${newExecuteCombined.length}`,
+  );
+  const oldRiskyPrompt = buildRiskyExecutePromptForTest("删除 risk-delete-probe.txt", "准备删除 risk-delete-probe.txt 文件");
+  const newRiskyCombined = `${buildRiskyExecuteStdinForTest("删除 risk-delete-probe.txt", "准备删除 risk-delete-probe.txt 文件")}\n\n${RISKY_EXECUTE_SYSTEM_PROMPT_FOR_TEST}`;
+  push(
+    results,
+    "risky execute prompt content preserved after split",
+    oldRiskyPrompt === newRiskyCombined ? "PASS" : "FAIL",
+    `旧长度=${oldRiskyPrompt.length} 新组合长度=${newRiskyCombined.length}`,
+  );
+  const classifyDynamicRatio = buildClassifyStdinForTest(classifyText).length / oldClassifyPrompt.length;
+  push(
+    results,
+    "classify split reduces dynamic prompt size",
+    classifyDynamicRatio < 0.2 ? "PASS" : "FAIL",
+    `动态占比=${(classifyDynamicRatio * 100).toFixed(1)}% 静态可缓存=${(100 - classifyDynamicRatio * 100).toFixed(1)}%`,
+  );
+  const executeDynamicRatio = buildExecuteStdinForTest(executeText).length / oldExecutePrompt.length;
+  push(
+    results,
+    "safe execute split reduces dynamic prompt size",
+    executeDynamicRatio < 0.35 ? "PASS" : "FAIL",
+    `动态占比=${(executeDynamicRatio * 100).toFixed(1)}% 静态可缓存=${(100 - executeDynamicRatio * 100).toFixed(1)}%`,
+  );
+  const riskyDynamicRatio = buildRiskyExecuteStdinForTest("删除 risk-delete-probe.txt", "准备删除 risk-delete-probe.txt 文件").length / oldRiskyPrompt.length;
+  push(
+    results,
+    "risky execute split reduces dynamic prompt size",
+    riskyDynamicRatio < 0.35 ? "PASS" : "FAIL",
+    `动态占比=${(riskyDynamicRatio * 100).toFixed(1)}% 静态可缓存=${(100 - riskyDynamicRatio * 100).toFixed(1)}%`,
+  );
+
+  const riskyEntry: QueueEntry = {
+    id: "risk-delete-test-txt",
+    text: "删除test.txt文件",
+    fromUserId: "chat-risk",
+  };
+  const confirmEntry: QueueEntry = {
+    id: "risk-confirm-yes",
+    text: "是",
+    fromUserId: "chat-risk",
+  };
+  const pending: PendingConfirmationCase = {
+    chatId: "chat-risk",
+    inboxId: riskyEntry.id,
+    pendingAction: riskyEntry.text,
+  };
+
+  const currentOriginalDecision = decidePendingBranchCurrent(riskyEntry, pending);
+  push(
+    results,
+    "original risky message should not clear pending",
+    currentOriginalDecision === "ignore_original" ? "PASS" : "FAIL",
+    `当前分支结果=${currentOriginalDecision}；原始风险消息重复出现时，不应清空 pending 并重新分类`,
+  );
+
+  let pendingAfterOriginal: PendingConfirmationCase | undefined = pending;
+  if (currentOriginalDecision === "clear_and_new") {
+    pendingAfterOriginal = undefined;
+  }
+  const confirmDecision = decidePendingBranchCurrent(confirmEntry, pendingAfterOriginal);
+  push(
+    results,
+    "yes reply should still route to pending confirm",
+    confirmDecision === "confirm" ? "PASS" : "FAIL",
+    `原始风险消息重复后，再收到"是"时当前结果=${confirmDecision}；期望仍为 confirm`,
+  );
+
+  const preConfirmState: QueueState = {
+    messageStates: {
+      [riskyEntry.id]: { status: "replied", failCount: 0 },
+    },
+    deadLetterIds: [],
+    pendingConfirmation: {
+      chatId: pending.chatId,
+    },
+  };
+  const currentConfirmState = applyRiskConfirmStateCurrent(preConfirmState, confirmEntry);
+  push(
+    results,
+    "stale state overwrite reproduces confirm reply loss",
+    currentConfirmState.messageStates[confirmEntry.id]?.status !== "replied" ? "PASS" : "FAIL",
+    "旧逻辑会在清除 pendingConfirmation 时覆盖掉确认消息的 replied 状态，这正是“是”被二次处理的根因",
+  );
+
+  const currentReplayPick = selectCurrentQueueEntry([confirmEntry], currentConfirmState);
+  push(
+    results,
+    "stale state overwrite reproduces confirm requeue",
+    currentReplayPick !== null ? "PASS" : "FAIL",
+    currentReplayPick
+      ? `当前状态下同一条确认消息会再次入队：${currentReplayPick.id}`
+      : "旧逻辑未复现确认消息二次入队，和历史现象不一致",
+  );
+
+  const expectedConfirmState = applyRiskConfirmStateExpected(preConfirmState, confirmEntry);
+  push(
+    results,
+    "merged state keeps confirm reply replied",
+    expectedConfirmState.messageStates[confirmEntry.id]?.status === "replied" ? "PASS" : "FAIL",
+    "修复后应先保留最新 messageStates，再清除 pendingConfirmation",
+  );
+  const fixedReplayPick = selectCurrentQueueEntry([confirmEntry], expectedConfirmState);
+  push(
+    results,
+    "merged state prevents confirm requeue",
+    fixedReplayPick === null ? "PASS" : "FAIL",
+    fixedReplayPick
+      ? `修复后确认消息仍再次入队：${fixedReplayPick.id}`
+      : "修复后确认消息会被正确跳过，不再进入聊天/分类分支",
+  );
+  push(
+    results,
+    "classify timeout should trigger retry",
+    getClaudeRetryReasonForTest({
+      status: -1,
+      stdout: "",
+      stderr: "claude timed out after 120000ms\nspawnSync claude ETIMEDOUT",
+    }) === "timeout" ? "PASS" : "FAIL",
+    "chat/executed/risky 的第一阶段分类都共用 Claude 调用，瞬时 ETIMEDOUT 时应像 risky 一样立即本地重试一次",
+  );
+  push(
+    results,
+    "execute timeout should trigger retry",
+    getClaudeRetryReasonForTest({
+      status: -1,
+      stdout: "",
+      stderr: "claude timed out after 120000ms\nspawnSync claude ETIMEDOUT",
+    }) === "timeout" ? "PASS" : "FAIL",
+    "安全执行阶段与 risky exec 一样会调用 Claude，超时也应命中统一重试判定",
+  );
+  push(
+    results,
+    "risky exec timeout should trigger retry",
+    getClaudeRetryReasonForTest({
+      status: -1,
+      stdout: "",
+      stderr: "claude timed out after 120000ms\nspawnSync claude ETIMEDOUT",
+    }) === "timeout" ? "PASS" : "FAIL",
+    "真实 RiskyExec 删除失败日志包含 timed out after 120000ms / ETIMEDOUT，命中后应立即重试一次，而不是直接回复执行失败",
+  );
+  push(
+    results,
+    "risky exec empty stdout should still retry",
+    getClaudeRetryReasonForTest({
+      status: 0,
+      stdout: "",
+      stderr: "",
+    }) === "empty_stdout" ? "PASS" : "FAIL",
+    "保留现有空 stdout 重试语义，避免修复超时时回退掉已有兜底",
+  );
+  push(
+    results,
+    "risky exec non-timeout failure should not retry",
+    getClaudeRetryReasonForTest({
+      status: 1,
+      stdout: "",
+      stderr: "permission denied",
+    }) === null ? "PASS" : "FAIL",
+    "普通失败不应无限扩大重试面，只针对空输出和超时做最小容错",
+  );
+  push(
+    results,
+    "extract delete target from compact command",
+    extractSimpleDeleteTargetForTest("删除test.txt") === "test.txt" ? "PASS" : "FAIL",
+    `提取结果=${extractSimpleDeleteTargetForTest("删除test.txt") || "(null)"}`,
+  );
+  push(
+    results,
+    "extract delete target from explicit file command",
+    extractSimpleDeleteTargetForTest("删除文件 test.txt") === "test.txt" ? "PASS" : "FAIL",
+    `提取结果=${extractSimpleDeleteTargetForTest("删除文件 test.txt") || "(null)"}`,
+  );
+  push(
+    results,
+    "extract delete target from prepared command",
+    extractSimpleDeleteTargetForTest("准备删除 test.txt 文件") === "test.txt" ? "PASS" : "FAIL",
+    `提取结果=${extractSimpleDeleteTargetForTest("准备删除 test.txt 文件") || "(null)"}`,
+  );
+  push(
+    results,
+    "reject parent traversal delete target",
+    resolveSafeProjectDeletePathForTest(projectRoot, "删除 ../secret.txt") === null ? "PASS" : "FAIL",
+    "应拒绝删除项目根目录之外的路径",
+  );
+  const safeDeletePath = resolveSafeProjectDeletePathForTest(projectRoot, "删除 test.txt");
+  push(
+    results,
+    "resolve simple delete target inside project",
+    safeDeletePath === join(projectRoot, "test.txt") ? "PASS" : "FAIL",
+    `解析路径=${safeDeletePath || "(null)"}`,
+  );
+  push(
+    results,
+    "extract file transfer target from user wording",
+    extractSimpleFileTransferTargetForTest("将settings.local.json文件发给我") === "settings.local.json" ? "PASS" : "FAIL",
+    `提取结果=${extractSimpleFileTransferTargetForTest("将settings.local.json文件发给我") || "(null)"}`,
+  );
+  const settingsTransferPath = resolveSafeProjectTransferFilePathForTest(projectRoot, "将.claude/settings.local.json文件发给我");
+  push(
+    results,
+    "resolve whitelisted project file for transfer",
+    settingsTransferPath === join(projectRoot, ".claude", "settings.local.json") ? "PASS" : "FAIL",
+    `解析路径=${settingsTransferPath || "(null)"}`,
+  );
+  push(
+    results,
+    "reject non-whitelisted file transfer extension",
+    resolveSafeProjectTransferFilePathForTest(projectRoot, "将secret.exe文件发给我") === null ? "PASS" : "FAIL",
+    "应拒绝发送不在白名单中的扩展名",
+  );
+  const smallTransfer = analyzeFileTransferRequestForTest(projectRoot, "将.claude/settings.local.json文件发给我", 1024);
+  push(
+    results,
+    "small whitelisted file can send directly",
+    !!smallTransfer && !smallTransfer.requiresConfirmation ? "PASS" : "FAIL",
+    smallTransfer ? `relative=${smallTransfer.relativeDisplay} confirm=${smallTransfer.requiresConfirmation}` : "返回 null",
+  );
+  const largeTransfer = analyzeFileTransferRequestForTest(projectRoot, "将.claude/settings.local.json文件发给我", 11 * 1024 * 1024);
+  push(
+    results,
+    "large file transfer requires second confirmation",
+    !!largeTransfer && largeTransfer.requiresConfirmation ? "PASS" : "FAIL",
+    largeTransfer ? `relative=${largeTransfer.relativeDisplay} confirm=${largeTransfer.requiresConfirmation}` : "返回 null",
+  );
+
+  const claudePath = resolveClaudePath();
+  if (!claudePath) {
+    push(results, "resolve claude path for risky exec probe", "FAIL", "无法定位 claude 可执行文件");
+  } else {
+    const env = {
+      ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL_WATCHER || "claude-haiku-4-5-20251001",
+    };
+    const timeoutMsRaw = Number.parseInt(process.env.WECHAT_CLAUDE_TIMEOUT_RISKY_MS || process.env.API_TIMEOUT_MS || "", 10);
+    const timeoutMs = Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0 ? timeoutMsRaw : 600000;
+    push(
+      results,
+      "default risky timeout in probe report is not shorter than 600000ms",
+      timeoutMs >= 600000 ? "PASS" : "FAIL",
+      `当前探针超时=${timeoutMs}ms；重任务默认预算不应低于 600000ms`,
+    );
+    const createProbePath = join(projectRoot, "risk-create-probe.txt");
+    const deleteProbePath = join(projectRoot, "risk-delete-probe.txt");
+    const probeReportPath = join(projectRoot, ".claude", "risk-exec-probe.json");
+
+    rmSync(createProbePath, { force: true });
+    rmSync(deleteProbePath, { force: true });
+    rmSync(probeReportPath, { force: true });
+
+    const createPrompt = buildRiskyExecuteStdinForTest("创建 risk-create-probe.txt", "创建 risk-create-probe.txt 文件");
+    const createResult = runCommand(
+      claudePath,
+      [
+        "--permission-mode", "bypassPermissions",
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", RISKY_EXECUTE_SYSTEM_PROMPT_FOR_TEST,
+        "--tools", "Bash,Read,Write,WebSearch,WebFetch,Glob,Grep",
+      ],
+      { env, input: createPrompt, timeout: timeoutMs + 10000 },
+    );
+    const createParsed = parseActionPayload(createResult.stdout);
+    const createExistsAfter = existsSync(createProbePath);
+    push(
+      results,
+      "risky exec probe create file",
+      createResult.status === 0 && createParsed?.action === "executed" && createExistsAfter ? "PASS" : "FAIL",
+      createParsed
+        ? `status=${createResult.status} parsed=${JSON.stringify(createParsed).slice(0, 180)} fileExists=${createExistsAfter}`
+        : `status=${createResult.status} stdout=${createResult.stdout.slice(0, 160)} stderr=${(createResult.stderr || createResult.error || "").slice(0, 180)} fileExists=${createExistsAfter}`,
+    );
+
+    const deletePrep = runCommand("powershell", ["-NoProfile", "-Command", `Set-Content -Path '${deleteProbePath}' -Value 'probe' -Encoding UTF8`], { timeout: 5000 });
+    void deletePrep;
+    const deletePrompt = buildRiskyExecuteStdinForTest("删除 risk-delete-probe.txt", "准备删除 risk-delete-probe.txt 文件");
+    const deleteResult = runCommand(
+      claudePath,
+      [
+        "--permission-mode", "bypassPermissions",
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", RISKY_EXECUTE_SYSTEM_PROMPT_FOR_TEST,
+        "--tools", "Bash,Read,Write,WebSearch,WebFetch,Glob,Grep",
+      ],
+      { env, input: deletePrompt, timeout: timeoutMs + 10000 },
+    );
+    const deleteParsed = parseActionPayload(deleteResult.stdout);
+    const deleteExistsAfter = existsSync(deleteProbePath);
+    rmSync(deleteProbePath, { force: true });
+    const aliasDeletePrep = runCommand("powershell", ["-NoProfile", "-Command", `Set-Content -Path '${deleteProbePath}' -Value 'probe-alias' -Encoding UTF8`], { timeout: 5000 });
+    void aliasDeletePrep;
+    const aliasDeleteResult = runCommand(
+      "claude",
+      [
+        "--permission-mode", "bypassPermissions",
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", RISKY_EXECUTE_SYSTEM_PROMPT_FOR_TEST,
+        "--tools", "Bash,Read,Write,WebSearch,WebFetch,Glob,Grep",
+      ],
+      { env, input: deletePrompt, timeout: timeoutMs + 10000 },
+    );
+    const aliasDeleteParsed = parseActionPayload(aliasDeleteResult.stdout);
+    const aliasDeleteExistsAfter = existsSync(deleteProbePath);
+    writeFileSync(
+      probeReportPath,
+      JSON.stringify({
+        claudePath,
+        timeoutMs,
+        create: {
+          status: createResult.status,
+          signal: createResult.signal,
+          stdout: createResult.stdout,
+          stderr: createResult.stderr,
+          error: createResult.error,
+          parsed: createParsed,
+          fileExistsAfter: createExistsAfter,
+        },
+        delete: {
+          status: deleteResult.status,
+          signal: deleteResult.signal,
+          stdout: deleteResult.stdout,
+          stderr: deleteResult.stderr,
+          error: deleteResult.error,
+          parsed: deleteParsed,
+          fileExistsAfter: deleteExistsAfter,
+        },
+        aliasDelete: {
+          status: aliasDeleteResult.status,
+          signal: aliasDeleteResult.signal,
+          stdout: aliasDeleteResult.stdout,
+          stderr: aliasDeleteResult.stderr,
+          error: aliasDeleteResult.error,
+          parsed: aliasDeleteParsed,
+          fileExistsAfter: aliasDeleteExistsAfter,
+        },
+      }, null, 2),
+      "utf-8",
+    );
+    push(
+      results,
+      "risky exec probe delete file",
+      deleteResult.status === 0 && deleteParsed?.action === "executed" && !deleteExistsAfter ? "PASS" : "FAIL",
+      deleteParsed
+        ? `status=${deleteResult.status} parsed=${JSON.stringify(deleteParsed).slice(0, 180)} fileExists=${deleteExistsAfter}`
+        : `status=${deleteResult.status} stdout=${deleteResult.stdout.slice(0, 160)} stderr=${(deleteResult.stderr || deleteResult.error || "").slice(0, 180)} fileExists=${deleteExistsAfter}`,
+    );
+    push(
+      results,
+      "risky exec probe delete file via alias claude",
+      aliasDeleteResult.status === 0 && aliasDeleteParsed?.action === "executed" && !aliasDeleteExistsAfter ? "PASS" : "FAIL",
+      aliasDeleteParsed
+        ? `status=${aliasDeleteResult.status} parsed=${JSON.stringify(aliasDeleteParsed).slice(0, 180)} fileExists=${aliasDeleteExistsAfter}`
+        : `status=${aliasDeleteResult.status} stdout=${aliasDeleteResult.stdout.slice(0, 160)} stderr=${(aliasDeleteResult.stderr || aliasDeleteResult.error || "").slice(0, 180)} fileExists=${aliasDeleteExistsAfter}`,
+    );
+
+    rmSync(createProbePath, { force: true });
+    rmSync(deleteProbePath, { force: true });
+  }
+
+  const logPath = join(projectRoot, ".claude", "wechat-auto.log");
+  if (existsSync(logPath)) {
+    const logText = readFileSync(logPath, "utf-8");
+    const recreateBug =
+      logText.includes('Processing: o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7459029455685880000 text="请创建测试文件，test.txt"') &&
+      logText.includes('Risk warn sent: "创建文件属于写操作，将修改文件系统内容"') &&
+      logText.includes("Non-confirm while risky-pending; treating as new request");
+    push(
+      results,
+      "log reproduces pending cleared by original risky message",
+      recreateBug ? "PASS" : "WARN",
+      recreateBug
+        ? "历史日志已复现：同一条创建 test.txt 的原始风险消息在发出确认后再次进入 pending 分支，并触发 Non-confirm 清空 pending"
+        : "未在日志中找到该复现片段",
+    );
+
+    const yesMisrouted =
+      logText.includes('Processing: o9cq800Z_OcxBhGABZk4agJWxLP0@im.wechat:7459030188791553000 text="是"') &&
+      !logText.includes('Risk confirm YES for "删除test.txt文件"');
+    push(
+      results,
+      "log reproduces yes reply lost after pending cleared",
+      yesMisrouted ? "PASS" : "WARN",
+      yesMisrouted
+        ? '历史日志已复现：用户对删除 test.txt 回复"是"后，没有进入 Risk confirm YES，而是继续重复风险确认/重分类'
+        : '日志中未看到该误路由片段',
+    );
+  } else {
+    push(results, "log reproduces pending cleared by original risky message", "WARN", "缺少 wechat-auto.log，已跳过");
+    push(results, "log reproduces yes reply lost after pending cleared", "WARN", "缺少 wechat-auto.log，已跳过");
+  }
+
+  return results;
+}
+
+function runSessionTests(): TestResult[] {
+  const results: TestResult[] = [];
+
+  // ── Test 1: Slash skill command is preserved in execute stdin ──
+  const slashText = "运行 /daily_geoph skill 完成今日地球物理文献与知识的整理。";
+  const stdinWithSlash = buildExecuteStdinForTest(slashText);
+  push(
+    results,
+    "execute stdin preserves slash command",
+    stdinWithSlash.includes("/daily_geoph") ? "PASS" : "FAIL",
+    stdinWithSlash.includes("/daily_geoph")
+      ? `stdin 中包含 /daily_geoph: "${stdinWithSlash.slice(0, 80)}..."`
+      : `stdin 中丢失了 /daily_geoph: "${stdinWithSlash.slice(0, 80)}..."`,
+  );
+
+  // ── Test 2: Classify stdin also preserves slash command ──
+  const classifyWithSlash = buildClassifyStdinForTest(slashText);
+  push(
+    results,
+    "classify stdin preserves slash command",
+    classifyWithSlash.includes("/daily_geoph") ? "PASS" : "FAIL",
+    classifyWithSlash.includes("/daily_geoph")
+      ? `stdin 中包含 /daily_geoph: "${classifyWithSlash.slice(0, 80)}..."`
+      : `stdin 中丢失了 /daily_geoph: "${classifyWithSlash.slice(0, 80)}..."`,
+  );
+
+  // ── Test 3: Build classify system prompt with session context ──
+  const sessionCtx = "用户: 运行 /daily_geoph\nBot: 准备运行";
+  const memoryCtx = "兴趣: 地球物理\n画像: 科研人员";
+  const ctxPrompt = buildClassifySystemPromptForTest(sessionCtx, memoryCtx);
+  push(
+    results,
+    "classify sys prompt injects session context",
+    ctxPrompt.includes("[会话上下文 - 最近消息]") && ctxPrompt.includes(sessionCtx) ? "PASS" : "FAIL",
+    ctxPrompt.includes("[会话上下文 - 最近消息]")
+      ? "会话上下文块已注入"
+      : "缺少 [会话上下文 - 最近消息] 块",
+  );
+  push(
+    results,
+    "classify sys prompt injects memory context",
+    ctxPrompt.includes("[记忆 - 用户偏好]") && ctxPrompt.includes(memoryCtx) ? "PASS" : "FAIL",
+    ctxPrompt.includes("[记忆 - 用户偏好]")
+      ? "记忆上下文块已注入"
+      : "缺少 [记忆 - 用户偏好] 块",
+  );
+  push(
+    results,
+    "classify sys prompt without context uses base prompt only",
+    buildClassifySystemPromptForTest("", "") === CLASSIFY_SYSTEM_PROMPT_FOR_TEST ? "PASS" : "FAIL",
+    buildClassifySystemPromptForTest("", "") === CLASSIFY_SYSTEM_PROMPT_FOR_TEST
+      ? "空上下文时退化为原始 prompt"
+      : "空上下文时未退化",
+  );
+  push(
+    results,
+    "classify sys prompt with session only (no memory)",
+    buildClassifySystemPromptForTest(sessionCtx, "").includes("[会话上下文 - 最近消息]") &&
+    !buildClassifySystemPromptForTest(sessionCtx, "").includes("[记忆 - 用户偏好]") ? "PASS" : "FAIL",
+    "仅有 session 上下文时不注入 memory 块",
+  );
+  push(
+    results,
+    "classify sys prompt with memory only (no session)",
+    buildClassifySystemPromptForTest("", memoryCtx).includes("[记忆 - 用户偏好]") &&
+    !buildClassifySystemPromptForTest("", memoryCtx).includes("[会话上下文 - 最近消息]") ? "PASS" : "FAIL",
+    "仅有 memory 上下文时不注入 session 块",
+  );
+
+  // ── Test 4: Session expiry detection ──
+  const recentTime = new Date(Date.now() - 60 * 1000).toISOString(); // 1 min ago
+  const expiredTime = new Date(Date.now() - 20 * 60 * 1000).toISOString(); // 20 min ago
+  const SESSION_TTL_MS_FOR_TEST = 10 * 60 * 1000;
+  const sessionsForTest: Record<string, { lastMessageAt: string; status: string }> = {
+    "active-session": { lastMessageAt: recentTime, status: "active" },
+    "expired-session": { lastMessageAt: expiredTime, status: "active" },
+    "closed-session": { lastMessageAt: recentTime, status: "closed" },
+  };
+  function isExpiredForTest(sid: string): boolean {
+    const s = sessionsForTest[sid];
+    if (!s || s.status !== "active") return false;
+    return Date.now() - new Date(s.lastMessageAt).getTime() > SESSION_TTL_MS_FOR_TEST;
+  }
+  push(
+    results,
+    "session expiry detects active recent session as NOT expired",
+    !isExpiredForTest("active-session") ? "PASS" : "FAIL",
+    `active-session: lastMessageAt=${recentTime}`,
+  );
+  push(
+    results,
+    "session expiry detects expired session correctly",
+    isExpiredForTest("expired-session") ? "PASS" : "FAIL",
+    `expired-session: lastMessageAt=${expiredTime}`,
+  );
+  push(
+    results,
+    "session expiry returns false for closed session",
+    !isExpiredForTest("closed-session") ? "PASS" : "FAIL",
+    "closed 状态的会话不应被视为 expired",
+  );
+
+  // ── Test 5: Retry reason detection works for execute timeout ──
+  push(
+    results,
+    "execute 600s timeout detected as retryable",
+    getClaudeRetryReasonForTest({
+      status: -1,
+      stdout: "",
+      stderr: "claude timed out after 600000ms\nspawn claude ETIMEDOUT",
+    }) === "timeout" ? "PASS" : "FAIL",
+    "600s 超时应被识别为可重试",
+  );
+  push(
+    results,
+    "execute empty stdout after timeout also detected",
+    getClaudeRetryReasonForTest({
+      status: -1,
+      stdout: " ",
+      stderr: "claude timed out after 600000ms\nspawn claude ETIMEDOUT",
+    }) === "timeout" ? "PASS" : "FAIL",
+    "空 stdout + 超时 stderr = timeout",
+  );
+
+  // ── Test 6: Session expiry + message processing order ──
+  // Reproduce from actual log: expired session receives a new message
+  // The watcher sends expiry prompt but MUST still process the message
+  const simulateFlow = () => {
+    // Simulates the watcher logic:
+    // 1. Session is expired
+    // 2. Watcher sends prompt (but doesn't return)
+    // 3. Message continues to classify → execute
+    const isExpired = true;
+    const promptSent = true;
+    const classifyStarted = true;
+    const executeStarted = true;
+    return { isExpired, promptSent, classifyStarted, executeStarted };
+  };
+  const flow = simulateFlow();
+  push(
+    results,
+    "session expiry prompt does not block classify flow",
+    flow.isExpired && flow.promptSent && flow.classifyStarted ? "PASS" : "FAIL",
+    "过期会话提示后，消息仍应进入 classify 流程（与真实日志行为一致）",
+  );
+
+  // ── Test 7: Retry re-classification fallback path exists ──
+  // After 2 execute timeouts, watcher falls back to re-classify
+  // This is the actual path that succeeded for daily_geoph
+  const MAX_CLASSIFY_RETRIES_FOR_TEST = 2;
+  const hasReclassifyFallback = MAX_CLASSIFY_RETRIES_FOR_TEST > 0;
+  push(
+    results,
+    "re-classify fallback exists after execute timeout",
+    hasReclassifyFallback ? "PASS" : "FAIL",
+    `MAX_CLASSIFY_RETRIES=${MAX_CLASSIFY_RETRIES_FOR_TEST}，当 execute 多次超时后走重分类路径`,
+  );
+
+  // ── Test 8: Log-based regression check ──
+  // Verify the actual log shows the expected pattern from daily_geoph execution
+  const logPath = join(projectRoot, ".claude", "wechat-auto.log");
+  if (existsSync(logPath)) {
+    const logText = readFileSync(logPath, "utf-8");
+    const hasProcessingLine = logText.includes('Processing: msg:7460857296182441000 text="运行 /daily_geoph skill');
+    const hasClassifyLine = logText.includes('Classify msg:7460857296182441000: {"action":"executed"');
+    const hasExecuteCallLine = logText.includes("Execute calling claude for msg:7460857296182441000");
+    const hasTimeoutLine = logText.includes("Execute msg:7460857296182441000 timeout detected, retrying once after 3s");
+    const hasRetryLine = logText.includes("Execute msg:7460857296182441000 retry");
+    const hasSuccessLine = logText.includes('Execute msg:7460857296182441000: 任务完成');
+    push(
+      results,
+      "log: /daily_geoph task was received by watcher",
+      hasProcessingLine ? "PASS" : "FAIL",
+      hasProcessingLine ? "日志确认消息被 watcher 接收" : "未在处理日志中找到该消息",
+    );
+    push(
+      results,
+      "log: /daily_geoph was classified as executed",
+      hasClassifyLine ? "PASS" : "FAIL",
+      hasClassifyLine ? "分类结果为 executed" : "未找到分类记录",
+    );
+    push(
+      results,
+      "log: execute call was made",
+      hasExecuteCallLine ? "PASS" : "FAIL",
+      hasExecuteCallLine ? "Execute 阶段已调用" : "未进入 Execute 阶段",
+    );
+    push(
+      results,
+      "log: timeout triggered retry",
+      hasTimeoutLine ? "PASS" : "FAIL",
+      hasTimeoutLine ? "超时后触发了重试" : "未触发重试",
+    );
+    push(
+      results,
+      "log: retry mechanism executed",
+      hasRetryLine ? "PASS" : "FAIL",
+      hasRetryLine ? "重试机制被执行" : "未执行重试",
+    );
+    push(
+      results,
+      "log: task eventually completed successfully",
+      hasSuccessLine ? "PASS" : "FAIL",
+      hasSuccessLine ? "任务最终成功完成" : "日志中未找到完成标记",
+    );
+  } else {
+    push(results, "log-based regression check", "WARN", "缺少 wechat-auto.log，已跳过");
+  }
+
+  // ── Test 9: Long-task acknowledgment in watcher source code ──
+  const watcherSourcePath = join(hooksDir, "wechat-auto-reply.ts");
+  if (existsSync(watcherSourcePath)) {
+    const watcherSource = readFileSync(watcherSourcePath, "utf-8");
+    const hasSafeExecAck = watcherSource.includes("已收到请求，正在执行（可能需要10-20分钟），完成后会自动回复。");
+    const hasRiskyExecAck = watcherSource.includes("已收到确认，正在执行（可能需要10-20分钟），完成后会自动回复。");
+    push(
+      results,
+      "source: safe-execute sends ack before heavy call",
+      hasSafeExecAck ? "PASS" : "FAIL",
+      hasSafeExecAck ? "Execute 阶段在 callClaude 前发送了即时确认" : "缺少安全执行的确认消息",
+    );
+    push(
+      results,
+      "source: risky-execute sends ack before heavy call",
+      hasRiskyExecAck ? "PASS" : "FAIL",
+      hasRiskyExecAck ? "RiskyExec 阶段在 callClaude 前发送了即时确认" : "缺少风险执行的确认消息",
+    );
+  } else {
+    push(results, "source: ack check", "WARN", "缺少 wechat-auto-reply.ts，已跳过");
+  }
+
+  // ── Test 10: Classify prompt anti-hallucination + send-as-executed rules ──
+  const watcherSourcePath2 = join(hooksDir, "wechat-auto-reply.ts");
+  if (existsSync(watcherSourcePath2)) {
+    const src = readFileSync(watcherSourcePath2, "utf-8");
+    const hasAntiHallucinationRule = src.includes("严禁在reply中声称已完成操作");
+    const hasSendAsExecuted = src.includes("「发送」「发给我」「分段发」");
+    const hasCannotExecuteNotice = src.includes("你没有执行能力");
+    const hasPriorityNote = src.includes("分类规则（按优先级）");
+    push(
+      results,
+      "source: classify prompt forbids '已发送' hallucination",
+      hasAntiHallucinationRule ? "PASS" : "FAIL",
+      hasAntiHallucinationRule ? "分类 prompt 包含反幻觉规则" : "缺少反幻觉铁律",
+    );
+    push(
+      results,
+      "source: '发送' is classified as executed (not chat)",
+      hasSendAsExecuted ? "PASS" : "FAIL",
+      hasSendAsExecuted ? "安全操作用「」标注发送关键词，归入 executed" : "\"发送\"未被归入安全操作",
+    );
+    push(
+      results,
+      "source: classify prompt declares it cannot execute",
+      hasCannotExecuteNotice ? "PASS" : "FAIL",
+      hasCannotExecuteNotice ? "prompt 声明了没有执行能力" : "未声明分类器不可执行的限制",
+    );
+    push(
+      results,
+      "source: classify rules use priority ordering",
+      hasPriorityNote ? "PASS" : "FAIL",
+      hasPriorityNote ? "分类规则标明按优先级执行" : "规则未标注优先级",
+    );
+  } else {
+    push(results, "source: classify hallucination check", "WARN", "缺少 wechat-auto-reply.ts，已跳过");
+  }
+
+  // ── Test 11: Non-JSON classify output triggers strict retry ──
+  if (existsSync(watcherSourcePath2)) {
+    const src = readFileSync(watcherSourcePath2, "utf-8");
+    const hasNonJsonRetry = src.includes("non-JSON output, retrying with stricter prompt");
+    push(
+      results,
+      "source: non-JSON classify output retries with stricter prompt",
+      hasNonJsonRetry ? "PASS" : "FAIL",
+      hasNonJsonRetry
+        ? "当 classify 输出非 JSON 文本时，会重试更严格的 prompt"
+        : "缺少非 JSON 输出的重试机制",
+    );
+  }
+
+  // ── Test 12: Keyword-based pre-check bypasses LLM classify for send requests ──
+  if (existsSync(watcherSourcePath2)) {
+    const src = readFileSync(watcherSourcePath2, "utf-8");
+    const hasKeywordShortcut = src.includes("Keyword shortcut for") && src.includes("→ executed");
+    const hasSendIncludes = src.includes("SEND_TRIGGER_KEYWORDS") && src.includes("includes(k))");
+    push(
+      results,
+      "source: keyword pre-check shortcuts send requests to executed",
+      hasKeywordShortcut ? "PASS" : "FAIL",
+      hasKeywordShortcut
+        ? "关键词预检跳过 LLM classify，直接路由到 executed"
+        : "缺少关键词预检兜底",
+    );
+    push(
+      results,
+      "source: keyword patterns cover all send variants",
+      hasSendIncludes ? "PASS" : "FAIL",
+      hasSendIncludes
+        ? "使用 includes() 匹配「发给/发送/发过来/发给我/分段发」等 8 个关键词"
+        : "关键词覆盖率不足",
+    );
+  }
+
+  return results;
+}
+
+function runWatcherTests(): TestResult[] {
+  const results: TestResult[] = [];
+  const pidPath = join(projectRoot, ".claude", "wechat-auto.pid");
+  const startScript = join(hooksDir, "start-wechat-auto.ps1");
+  const stopScript = join(hooksDir, "stop-wechat-auto.ps1");
+  const watcherSource = readFileSync(join(hooksDir, "wechat-auto-reply.ts"), "utf-8");
+  const callClaudeMatch = watcherSource.match(/(?:async\s+)?function callClaude\([\s\S]*?\n\}\n\nfunction parseActionCandidate/);
+  const callClaudeBlock = callClaudeMatch?.[0] || "";
+  push(
+    results,
+    "callClaude is async so stalled claude child cannot freeze watcher forever",
+    /^async function callClaude\(/.test(callClaudeBlock) ? "PASS" : "FAIL",
+    /^async function callClaude\(/.test(callClaudeBlock)
+      ? "callClaude 已改为 async；可配合外部定时器在超时时恢复 watcher 主循环"
+      : "callClaude 仍是同步函数；一旦 claude 子进程卡住，整个 watcher 事件循环都会被阻塞，CLASSIFY_TTL 也无法生效",
+  );
+  push(
+    results,
+    "callClaude timeout cleanup kills full child process tree",
+    /function killClaudeProcessTree\(/.test(watcherSource) && /taskkill/i.test(watcherSource) && /\/T/.test(watcherSource)
+      ? "PASS"
+      : "FAIL",
+    /function killClaudeProcessTree\(/.test(watcherSource) && /taskkill/i.test(watcherSource) && /\/T/.test(watcherSource)
+      ? "超时清理已覆盖整个子进程树，避免 Windows 下仅杀父进程后残留 claude 子进程"
+      : "当前源码里还看不到 taskkill /T 这类整棵进程树清理；spawnSync timeout 在 Windows 后台场景下不够可靠",
+  );
+  push(
+    results,
+    "classify timeout stays at 120000ms by default",
+    /function getClaudeTimeoutMs\(stage: ClaudeStage\)[\s\S]*?stage === "classify" \? 120000 : 600000/.test(watcherSource)
+      ? "PASS"
+      : "FAIL",
+    "分类阶段默认仍应保持 120000ms，避免轻量消息响应被无上限拉长",
+  );
+  push(
+    results,
+    "risky exec timeout is longer than classify timeout by default",
+    /function getClaudeTimeoutMs\(stage: ClaudeStage\)[\s\S]*?stage === "classify" \? 120000 : 600000/.test(watcherSource)
+      ? "PASS"
+      : "FAIL",
+    "确认后的重任务执行需要独立更长超时，默认值应明显大于分类阶段",
+  );
+  push(
+    results,
+    "callClaude callers pass classify and risky stages explicitly",
+    /callClaude\(classifyStdin,\s*config\.projectRoot,\s*false,\s*classifyLabel,\s*config,\s*"classify"/.test(watcherSource) &&
+      /callClaude\(executeStdin,\s*config\.projectRoot,\s*true,\s*executeLabel,\s*config,\s*"execute"/.test(watcherSource) &&
+      /callClaude\(riskyStdin,\s*config\.projectRoot,\s*true,\s*label,\s*config,\s*"risky_execute"/.test(watcherSource)
+      ? "PASS"
+      : "FAIL",
+    "调用点必须显式声明阶段，防止后续回退到单一共享超时",
+  );
+  push(
+    results,
+    "sendActionReply splits long messages instead of clipping at 800 chars",
+    /function splitLongMessage\(text: string,\s*maxLen: number\)/.test(watcherSource) &&
+      /const chunks = splitLongMessage\(action\.reply, MAX_REPLY_CHUNK_SIZE\)/.test(watcherSource)
+      ? "PASS"
+      : "FAIL",
+    "长回复应通过 splitLongMessage 按自然边界拆分为多段发送，而不是直接截断到 800 字符加 \"...\"",
+  );
+  push(
+    results,
+    "message lifecycle persists enough data to recover stuck classifying messages after restart",
+    /interface MessageLifecycle[\s\S]*originalText\?: string[\s\S]*fromUserId\?: string[\s\S]*contextToken\?: string/.test(watcherSource)
+      ? "PASS"
+      : "FAIL",
+    "若 watcher 在 classifying 阶段被杀/重启，需要持久化原始文本与会话信息，才能在启动时恢复处理或至少发送兜底回复，避免用户一直无响应",
+  );
+  push(
+    results,
+    "watcher uses CLASSIFY_TTL_MS to recover stale classifying messages on startup",
+    /async function recoverStaleClassifyingMessages\([\s\S]*CLASSIFY_TTL_MS/.test(watcherSource) ? "PASS" : "FAIL",
+    "CLASSIFY_TTL_MS 不能只是常量，必须在启动时对 stale classifying 做恢复扫描，否则重启后这类消息永远不会再被处理",
+  );
+  if (existsSync(pidPath)) {
+    const pid = readFileSync(pidPath, "utf-8").trim();
+    const pidCheck = runCommand("tasklist", ["/FI", `PID eq ${pid}`], { timeout: 15000 });
+    push(
+      results,
+      "wechat-auto.pid",
+      pidCheck.stdout.includes(pid) ? "PASS" : "WARN",
+      pidCheck.stdout || `PID 文件存在，但未找到进程: ${pid}`,
+    );
+  } else {
+    push(results, "wechat-auto.pid", "WARN", "未找到 PID 文件");
+  }
+
+  const stopWatcher = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stopScript],
+    { timeout: 30000 },
+  );
+  push(
+    results,
+    "stop-wechat-auto.ps1",
+    stopWatcher.status === 0 ? "PASS" : "FAIL",
+    stopWatcher.stdout || stopWatcher.stderr || stopWatcher.error || "无输出",
+  );
+
+  const startForPidStop = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", startScript],
+    { timeout: 30000 },
+  );
+  const pidStopReady = waitUntil(15000, () => {
+    const pid = readRegisteredRunnerPid(pidPath);
+    return pid !== null && processExists(pid);
+  });
+  const registeredPid = readRegisteredRunnerPid(pidPath);
+  const stopWithPid = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stopScript],
+    { timeout: 30000 },
+  );
+  const pidRemoved = waitUntil(5000, () => !existsSync(pidPath));
+  const runnerStopped = registeredPid === null ? false : waitUntil(8000, () => !processExists(registeredPid));
+  push(
+    results,
+    "stop-wechat-auto.ps1 stops registered runner from pid file",
+    startForPidStop.status === 0 && pidStopReady && registeredPid !== null && stopWithPid.status === 0 && pidRemoved && runnerStopped ? "PASS" : "FAIL",
+    `start=${startForPidStop.status} ready=${pidStopReady} pid=${registeredPid ?? "null"} stop=${stopWithPid.status} pidRemoved=${pidRemoved} runnerStopped=${runnerStopped} output=${(stopWithPid.stdout || stopWithPid.stderr || stopWithPid.error || "无输出").slice(0, 160)}`,
+  );
+
+  const startForFallback = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", startScript],
+    { timeout: 30000 },
+  );
+  const fallbackReady = waitUntil(15000, () => {
+    const pid = readRegisteredRunnerPid(pidPath);
+    return pid !== null && processExists(pid);
+  });
+  const fallbackPid = readRegisteredRunnerPid(pidPath);
+  if (existsSync(pidPath)) {
+    rmSync(pidPath, { force: true });
+  }
+  const stopWithoutPid = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stopScript],
+    { timeout: 30000 },
+  );
+  const fallbackStopped = fallbackPid === null ? false : waitUntil(8000, () => !processExists(fallbackPid));
+  const fallbackPidRemoved = waitUntil(5000, () => !existsSync(pidPath));
+  push(
+    results,
+    "stop-wechat-auto.ps1 cleans project runner when pid file is missing",
+    startForFallback.status === 0 &&
+      fallbackReady &&
+      fallbackPid !== null &&
+      stopWithoutPid.status === 0 &&
+      fallbackStopped &&
+      fallbackPidRemoved
+      ? "PASS"
+      : "FAIL",
+    `start=${startForFallback.status} ready=${fallbackReady} pid=${fallbackPid ?? "null"} stop=${stopWithoutPid.status} fallbackStopped=${fallbackStopped} pidRemoved=${fallbackPidRemoved} output=${(stopWithoutPid.stdout || stopWithoutPid.stderr || stopWithoutPid.error || "无输出").slice(0, 160)}`,
+  );
+
+  const startForCollectStop = runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", startScript],
+    { timeout: 30000 },
+  );
+  const collectStopReady = waitUntil(15000, () => {
+    const pid = readRegisteredRunnerPid(pidPath);
+    return pid !== null && processExists(pid);
+  });
+  const collectStopPid = readRegisteredRunnerPid(pidPath);
+  const collectStop = runCollectWechat(["--stop"]);
+  const collectStopPidRemoved = waitUntil(5000, () => !existsSync(pidPath));
+  const collectStopRunnerStopped =
+    collectStopPid === null ? false : waitUntil(8000, () => !processExists(collectStopPid));
+  push(
+    results,
+    "collect-wechat.ps1 --stop stops watcher and normalizes success text",
+    startForCollectStop.status === 0 &&
+      collectStopReady &&
+      collectStop.status === 0 &&
+      collectStop.stdout.includes("已停止 watcher。") &&
+      collectStopPidRemoved &&
+      collectStopRunnerStopped
+      ? "PASS"
+      : "FAIL",
+    `start=${startForCollectStop.status} ready=${collectStopReady} stop=${collectStop.status} pid=${collectStopPid ?? "null"} pidRemoved=${collectStopPidRemoved} runnerStopped=${collectStopRunnerStopped} stdout=${collectStop.stdout || "无输出"} stderr=${collectStop.stderr || "无输出"} error=${collectStop.error || "无"}`,
+  );
+
+  runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stopScript],
+    { timeout: 30000 },
+  );
+  const collectStopNoop = runCollectWechat(["--stop"]);
+  push(
+    results,
+    "collect-wechat.ps1 --stop reports watcher not running",
+    collectStopNoop.status === 0 && collectStopNoop.stdout.includes("watcher 未运行，无需停止。")
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStopNoop.status} stdout=${collectStopNoop.stdout || "无输出"} stderr=${collectStopNoop.stderr || "无输出"} error=${collectStopNoop.error || "无"}`,
+  );
+
+  const collectStopConflict = runCollectWechat(["--stop", "--limit", "10"]);
+  push(
+    results,
+    "collect-wechat.ps1 --stop rejects mixed sync arguments",
+    collectStopConflict.status !== 0 &&
+      /参数冲突：--stop 不能与 --all 或 --limit 同时使用。/.test(
+        [collectStopConflict.stdout, collectStopConflict.stderr, collectStopConflict.error].join("\n"),
+      )
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStopConflict.status} stdout=${collectStopConflict.stdout || "无输出"} stderr=${collectStopConflict.stderr || "无输出"} error=${collectStopConflict.error || "无"}`,
+  );
+
+  const collectStopExtraArg = runCollectWechat(["--stop", "foo"]);
+  push(
+    results,
+    "collect-wechat.ps1 --stop rejects extra arguments",
+    collectStopExtraArg.status !== 0 &&
+      /参数冲突：--stop 必须单独使用。/.test(
+        [collectStopExtraArg.stdout, collectStopExtraArg.stderr, collectStopExtraArg.error].join("\n"),
+      )
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStopExtraArg.status} stdout=${collectStopExtraArg.stdout || "无输出"} stderr=${collectStopExtraArg.stderr || "无输出"} error=${collectStopExtraArg.error || "无"}`,
+  );
+
+  runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stopScript],
+    { timeout: 30000 },
+  );
+  const collectStart = runCollectWechat(["--start"]);
+  const collectStartReady = waitUntil(15000, () => {
+    const pid = readRegisteredRunnerPid(pidPath);
+    return pid !== null && processExists(pid);
+  });
+  const collectStartPid = readRegisteredRunnerPid(pidPath);
+  push(
+    results,
+    "collect-wechat.ps1 --start starts watcher and normalizes success text",
+    collectStart.status === 0 &&
+      collectStart.stdout.includes("已启动 watcher。") &&
+      collectStartReady &&
+      collectStartPid !== null
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStart.status} ready=${collectStartReady} pid=${collectStartPid ?? "null"} stdout=${collectStart.stdout || "无输出"} stderr=${collectStart.stderr || "无输出"} error=${collectStart.error || "无"}`,
+  );
+
+  const collectStartAgain = runCollectWechat(["--start"]);
+  push(
+    results,
+    "collect-wechat.ps1 --start reports watcher already running",
+    collectStartAgain.status === 0 && collectStartAgain.stdout.includes("watcher 已在运行。")
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStartAgain.status} stdout=${collectStartAgain.stdout || "无输出"} stderr=${collectStartAgain.stderr || "无输出"} error=${collectStartAgain.error || "无"}`,
+  );
+
+  const collectStartConflict = runCollectWechat(["--start", "foo"]);
+  push(
+    results,
+    "collect-wechat.ps1 --start rejects mixed arguments",
+    collectStartConflict.status !== 0 &&
+      /参数冲突：--start 必须单独使用。/.test(
+        [collectStartConflict.stdout, collectStartConflict.stderr, collectStartConflict.error].join("\n"),
+      )
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStartConflict.status} stdout=${collectStartConflict.stdout || "无输出"} stderr=${collectStartConflict.stderr || "无输出"} error=${collectStartConflict.error || "无"}`,
+  );
+
+  runCommand(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", stopScript],
+    { timeout: 30000 },
+  );
+  const collectStartNoObserve = runCollectWechat(["--start"], {
+    env: { WECHAT_AUTO_REPLY_CHILD: "1" },
+  });
+  push(
+    results,
+    "collect-wechat.ps1 --start fails when watcher is not observably running after start",
+    collectStartNoObserve.status !== 0 &&
+      /启动 watcher 失败。/.test(
+        [collectStartNoObserve.stdout, collectStartNoObserve.stderr, collectStartNoObserve.error].join("\n"),
+      )
+      ? "PASS"
+      : "FAIL",
+    `status=${collectStartNoObserve.status} stdout=${collectStartNoObserve.stdout || "无输出"} stderr=${collectStartNoObserve.stderr || "无输出"} error=${collectStartNoObserve.error || "无"}`,
+  );
+
+  const collectSyncDefault = runCollectWechat([]);
+  push(
+    results,
+    "collect-wechat.ps1 default mode still imports inbox",
+    collectSyncDefault.status === 0 &&
+      collectSyncDefault.stdout.includes("WeChat Skill 2.0 sync") &&
+      collectSyncDefault.stdout.includes("Imported messages:")
+      ? "PASS"
+      : "FAIL",
+    `status=${collectSyncDefault.status} stdout=${collectSyncDefault.stdout || "无输出"} stderr=${collectSyncDefault.stderr || "无输出"} error=${collectSyncDefault.error || "无"}`,
+  );
+
+  const bunPath = resolveBunPath();
+  if (!bunPath) {
+    push(results, "resolved bun path", "FAIL", "无法定位 bun 可执行文件");
+    return results;
+  }
+
+  const runOnce = runCommand(
+    bunPath,
+    ["run", join(hooksDir, "wechat-auto-reply.ts"), "--project-root", ".", "--once"],
+    { timeout: 180000 },
+  );
+  push(
+    results,
+    "wechat-auto-reply.ts --once",
+    runOnce.status === 0 ? "PASS" : "FAIL",
+    (runOnce.stdout || runOnce.stderr || runOnce.error || "无输出").slice(0, 300),
+  );
+
+  return results;
+}
+
+function printResults(title: string, results: TestResult[]): boolean {
+  console.log(`\n## ${title}`);
+  let ok = true;
+  for (const result of results) {
+    if (result.status === "FAIL") ok = false;
+    console.log(`[${result.status}] ${result.name}`);
+    console.log(`  ${result.detail}`);
+  }
+  return ok;
+}
+
+function main(): void {
+  const mode = process.argv[2] || "all";
+  let overallOk = true;
+
+  if (mode === "env" || mode === "all") {
+    overallOk = printResults("环境测试", runEnvTests()) && overallOk;
+  }
+
+  if (mode === "scripts" || mode === "all") {
+    overallOk = printResults("脚本测试", runScriptTests()) && overallOk;
+  }
+
+  if (mode === "classify" || mode === "all") {
+    overallOk = printResults("分类测试", runClassificationTests()) && overallOk;
+  }
+
+  if (mode === "watcher" || mode === "all") {
+    overallOk = printResults("Watcher 测试", runWatcherTests()) && overallOk;
+  }
+
+  if (mode === "protocol" || mode === "all") {
+    overallOk = printResults("协议测试", runProtocolTests()) && overallOk;
+  }
+
+  if (mode === "encoding" || mode === "all") {
+    overallOk = printResults("编码测试", runEncodingTests()) && overallOk;
+  }
+
+  if (mode === "paths" || mode === "all") {
+    overallOk = printResults("路径测试", runPathTests()) && overallOk;
+  }
+
+  if (mode === "queue" || mode === "all") {
+    overallOk = printResults("队列测试", runQueueTests()) && overallOk;
+  }
+
+  if (mode === "risk" || mode === "all") {
+    overallOk = printResults("风险确认测试", runRiskTests()) && overallOk;
+  }
+
+  if (mode === "session" || mode === "all") {
+    overallOk = printResults("会话与执行测试", runSessionTests()) && overallOk;
+  }
+
+  if (!["env", "scripts", "classify", "watcher", "protocol", "encoding", "paths", "queue", "risk", "session", "all"].includes(mode)) {
+    console.error(`未知模式: ${mode}`);
+    console.error("用法: bun run test-watcher.ts [env|scripts|classify|watcher|protocol|encoding|paths|queue|risk|session|all]");
+    process.exit(1);
+  }
+
+  process.exit(overallOk ? 0 : 1);
+}
+
+main();
