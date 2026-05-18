@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, normalize, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import * as platform from "../../platform";
 
 process.stdout.setDefaultEncoding("utf-8");
 process.stderr.setDefaultEncoding("utf-8");
@@ -222,27 +223,10 @@ function resolveClaudeExecutable(): string {
     return claudeExecutableCache;
   }
 
-  const whereClaude = spawnSync("where.exe", ["claude"], {
-    encoding: "utf-8",
-    timeout: 15000,
-    env: process.env,
-  });
-  const candidates = (whereClaude.stdout || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (candidate.toLowerCase().endsWith(".exe") && existsSync(candidate)) {
-      claudeExecutableCache = candidate;
-      return candidate;
-    }
-
-    const siblingExe = join(dirname(candidate), "claude.exe");
-    if (existsSync(siblingExe)) {
-      claudeExecutableCache = siblingExe;
-      return siblingExe;
-    }
+  const candidate = platform.findExecutable("claude");
+  if (candidate && existsSync(candidate)) {
+    claudeExecutableCache = candidate;
+    return candidate;
   }
 
   claudeExecutableCache = null;
@@ -708,22 +692,9 @@ function killClaudeProcessTree(pid: number, config: AutoReplyConfig, logLabel: s
   }
 
   try {
-    if (process.platform === "win32") {
-      const kill = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        encoding: "utf-8",
-        timeout: 15000,
-        windowsHide: true,
-      });
-      if (kill.status !== 0) {
-        const stderr = (kill.stderr || "").trim();
-        if (stderr && !/not found|没有运行的任务|no running instance/i.test(stderr)) {
-          logLine(config, `${logLabel} taskkill failed: ${stderr.slice(0, 160)}`);
-        }
-      }
-      return;
+    if (!platform.killProcess(pid, "SIGKILL")) {
+       // if it failed, it might be because it was already dead, which is fine
     }
-
-    process.kill(pid, "SIGKILL");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/not found|ESRCH/i.test(message)) {
@@ -759,7 +730,7 @@ async function callClaude(
       const child = spawn(claudeExecutable, args, {
         cwd: projectRoot,
         stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
+        ...platform.spawnOptions(),
         env: {
           ...process.env,
           ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL_WATCHER || "claude-haiku-4-5-20251001",

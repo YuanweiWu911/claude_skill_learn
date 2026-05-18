@@ -6,6 +6,7 @@
 import { existsSync, readFileSync, readdirSync, appendFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import * as platform from "./platform";
 
 // ── Project root = directory of this exe ─────────────────
 const PROJ = resolve(import.meta.dir || dirname(process.execPath));
@@ -13,7 +14,7 @@ const PORT = 3456;
 
 const CLAUDE_DIR = join(PROJ, ".claude");
 const SKILL_DIR = join(PROJ, ".claude", "skills", "wechat-skill-2");
-const COLLECT_PS1 = join(SKILL_DIR, "collect-wechat.ps1");
+const COLLECT_SCRIPT = join(SKILL_DIR, "collect-wechat" + platform.shellScriptExt());
 const GUI_HTML = join(PROJ, "wechat-skill-gui.html");
 const PID_PATH = join(CLAUDE_DIR, "wechat-auto.pid");
 const STATE_PATH = join(CLAUDE_DIR, "wechat-auto-state.json");
@@ -33,6 +34,7 @@ log(`========================================`);
 log(`WeChat Skill Launcher v2`);
 log(`PROJ=${PROJ}`);
 log(`PID_PATH=${PID_PATH}`);
+log(`OS=${process.platform}`);
 
 // ═══════════════════════════════════════════════════════
 //  HELPERS
@@ -48,10 +50,7 @@ function getWatcherPid(): number {
     const raw = readFileSync(PID_PATH, "utf-8").trim();
     const pid = parseInt(raw, 10);
     if (!Number.isFinite(pid) || pid <= 0) return 0;
-    const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
-      encoding: "utf-8", timeout: 5000, windowsHide: true,
-    });
-    return r.stdout.includes(`"${pid}"`) ? pid : 0;
+    return platform.isProcessAlive(pid) ? pid : 0;
   } catch { return 0; }
 }
 
@@ -130,15 +129,15 @@ function startWatcher(): Promise<boolean> {
       resolve_(true);
       return;
     }
-    if (!existsSync(COLLECT_PS1)) {
-      log(`COLLECT_PS1 not found at ${COLLECT_PS1}`);
+    if (!existsSync(COLLECT_SCRIPT)) {
+      log(`COLLECT_SCRIPT not found at ${COLLECT_SCRIPT}`);
       resolve_(false);
       return;
     }
     log("Starting watcher...");
-    const proc = spawn("powershell", [
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", COLLECT_PS1, "--start",
-    ], { cwd: PROJ, stdio: "pipe", windowsHide: true, env: { ...process.env, BUN_UTF8: "1" } });
+    const proc = spawn(platform.shellRunner(), [
+      ...platform.shellArgs(), COLLECT_SCRIPT, "--start",
+    ], { cwd: PROJ, stdio: "pipe", ...platform.spawnOptions(), env: { ...process.env, BUN_UTF8: "1" } });
 
     let stdout = "";
     proc.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
@@ -161,16 +160,13 @@ let _bunPathCache: string | null = null;
 
 function findBun(): string {
   if (_bunPathCache) return _bunPathCache;
-  const result = spawnSync("where.exe", ["bun"], { encoding: "utf-8", timeout: 5000, windowsHide: true });
-  for (const line of (result.stdout || "").split(/\r?\n/)) {
-    const t = line.trim();
-    if (t && existsSync(t)) {
-      if (t.toLowerCase().endsWith(".exe")) { _bunPathCache = t; return t; }
-      if (t.toLowerCase().endsWith(".cmd")) { _bunPathCache = t; return t; }
-    }
+  const exe = platform.findExecutable("bun");
+  if (exe && existsSync(exe)) {
+    _bunPathCache = exe;
+    return exe;
   }
-  _bunPathCache = "bun.exe";
-  return "bun.exe";
+  _bunPathCache = platform.isWindows() ? "bun.exe" : "bun";
+  return _bunPathCache;
 }
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -235,24 +231,24 @@ async function handleRequest(req: Request): Promise<Response> {
     return json({ success: ok, message: ok ? "Watcher 已启动" : "启动失败" });
   }
   if (route === "watcher/stop" && method === "POST") {
-    const r = spawnSync("powershell", [
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-      join(CLAUDE_DIR, "hooks", "stop-wechat-auto.ps1"),
-    ], { cwd: PROJ, encoding: "utf-8", timeout: 15000, windowsHide: true });
+    spawnSync(platform.shellRunner(), [
+      ...platform.shellArgs(),
+      join(CLAUDE_DIR, "hooks", "stop-wechat-auto" + platform.shellScriptExt()),
+    ], { cwd: PROJ, encoding: "utf-8", timeout: 15000, ...platform.spawnOptions() });
     return json({ success: true, message: "Watcher 已停止" });
   }
   if (route === "watcher/restart" && method === "POST") {
-    spawnSync("powershell", [
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-      join(CLAUDE_DIR, "hooks", "stop-wechat-auto.ps1"),
-    ], { cwd: PROJ, timeout: 10000, windowsHide: true });
+    spawnSync(platform.shellRunner(), [
+      ...platform.shellArgs(),
+      join(CLAUDE_DIR, "hooks", "stop-wechat-auto" + platform.shellScriptExt()),
+    ], { cwd: PROJ, timeout: 10000, ...platform.spawnOptions() });
     const ok = await startWatcher();
     return json({ success: ok, message: ok ? "Watcher 已重启" : "重启失败" });
   }
   if (route === "watcher/poll" && method === "POST") {
-    const r = spawnSync("powershell", [
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", COLLECT_PS1,
-    ], { cwd: PROJ, encoding: "utf-8", timeout: 15000, windowsHide: true });
+    const r = spawnSync(platform.shellRunner(), [
+      ...platform.shellArgs(), COLLECT_SCRIPT,
+    ], { cwd: PROJ, encoding: "utf-8", timeout: 15000, ...platform.spawnOptions(), env: { ...process.env, BUN_UTF8: "1" } });
     return json({ success: true, message: "已触发轮询" });
   }
 
@@ -481,10 +477,8 @@ async function main() {
   // 3. Open browser (only in non-hidden mode)
   if (!hidden) {
     log("Opening browser...");
-    try {
-      spawnSync("cmd.exe", ["/c", "start", "", `http://localhost:${PORT}`], { timeout: 8000, windowsHide: true });
-      log("✓ Browser opened");
-    } catch { log("⚠ Could not open browser"); }
+    platform.openBrowser(`http://localhost:${PORT}`);
+    log("✓ Browser opened attempt");
   }
 
   log("");

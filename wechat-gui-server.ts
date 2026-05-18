@@ -2,6 +2,7 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import * as platform from "./platform";
 
 const PROJECT_ROOT = resolve(import.meta.dir || process.cwd());
 const CLAUDE_DIR = join(PROJECT_ROOT, ".claude");
@@ -14,23 +15,23 @@ const PID_PATH = join(CLAUDE_DIR, "wechat-auto.pid");
 const PORT = parseInt(process.env.GUI_PORT || "3456", 10);
 
 const SKILL_DIR = join(PROJECT_ROOT, ".claude", "skills", "wechat-skill-2");
-const COLLECT_PS1 = join(SKILL_DIR, "collect-wechat.ps1");
-const STOP_PS1 = join(CLAUDE_DIR, "hooks", "stop-wechat-auto.ps1");
-const START_PS1 = join(CLAUDE_DIR, "hooks", "start-wechat-auto.ps1");
+const COLLECT_SCRIPT = join(SKILL_DIR, "collect-wechat" + platform.shellScriptExt());
+const STOP_SCRIPT = join(CLAUDE_DIR, "hooks", "stop-wechat-auto" + platform.shellScriptExt());
+const START_SCRIPT = join(CLAUDE_DIR, "hooks", "start-wechat-auto" + platform.shellScriptExt());
 
 function psRun(script: string, args: string[] = []): { stdout: string; stderr: string; exitCode: number } {
   const result = spawnSync(
-    "powershell",
+    platform.shellRunner(),
     [
-      "-NoProfile", "-ExecutionPolicy", "Bypass",
-      "-File", script,
+      ...platform.shellArgs(),
+      script,
       ...args,
     ],
     {
       cwd: PROJECT_ROOT,
       encoding: "utf-8",
       timeout: 30000,
-      windowsHide: true,
+      ...platform.spawnOptions(),
       env: { ...process.env, BUN_UTF8: "1" },
     },
   );
@@ -52,13 +53,7 @@ function getWatcherPid(): number {
     const pid = parseInt(pidRaw, 10);
     if (!Number.isFinite(pid) || pid <= 0) return 0;
 
-    const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
-      encoding: "utf-8",
-      timeout: 5000,
-      windowsHide: true,
-    });
-    if (result.status !== 0) return 0;
-    return result.stdout.includes(`"${pid}"`) ? pid : 0;
+    return platform.isProcessAlive(pid) ? pid : 0;
   } catch {
     return 0;
   }
@@ -248,7 +243,7 @@ async function handleRequest(req: Request): Promise<Response> {
     if (isWatcherRunning()) {
       return jsonResponse({ success: true, message: "Watcher 已在运行中" });
     }
-    const result = psRun(START_PS1);
+    const result = psRun(START_SCRIPT);
     if (result.exitCode !== 0) {
       return jsonResponse({
         success: false,
@@ -268,7 +263,7 @@ async function handleRequest(req: Request): Promise<Response> {
     if (!isWatcherRunning()) {
       return jsonResponse({ success: true, message: "Watcher 未在运行" });
     }
-    const result = psRun(STOP_PS1);
+    const result = psRun(STOP_SCRIPT);
     return jsonResponse({
       success: true,
       message: "Watcher 已停止",
@@ -279,10 +274,13 @@ async function handleRequest(req: Request): Promise<Response> {
   // POST /api/watcher/restart
   if (route === "watcher/restart" && method === "POST") {
     if (isWatcherRunning()) {
-      psRun(STOP_PS1);
-      await Bun.sleep(1000);
+      psRun(STOP_SCRIPT);
+      // We don't have Bun.sleep available easily in a generic way here without Bun,
+      // but this is a Bun script, so we can use it. 
+      // The linter error for Bun is because it's a global in Bun.
+      await (globalThis as any).Bun.sleep(1000);
     }
-    const result = psRun(START_PS1);
+    const result = psRun(START_SCRIPT);
     const running = isWatcherRunning();
     return jsonResponse({
       success: running,
@@ -292,7 +290,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
   // POST /api/watcher/poll
   if (route === "watcher/poll" && method === "POST") {
-    const result = psRun(COLLECT_PS1, []);
+    const result = psRun(COLLECT_SCRIPT, []);
     return jsonResponse({
       success: true,
       message: "消息轮询触发完成",
