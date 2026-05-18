@@ -120,6 +120,7 @@ interface WindowMessage {
 interface UserMemory {
   userId: string;
   updatedAt: string;
+  lastMemoryUpdateAt?: string;
   interests: string[];
   stats: {
     totalInteractions: number;
@@ -155,6 +156,7 @@ const DIRECT_SEND_ALLOWED_EXTENSIONS = new Set([
 ]);
 
 const SESSION_TTL_MS = 10 * 60 * 1000;
+const MEMORY_UPDATE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_WINDOW_MESSAGES = 20;
 const MEMORY_L1_CHARS = 500;
 const MAX_CONTEXT_CHARS = 800;
@@ -1434,6 +1436,16 @@ async function updateMemoryOnSessionClose(
   wrappedSendText: (params: { to: string; text: string; contextToken: string }) => Promise<boolean>,
 ): Promise<void> {
   if (session.messageCount < 2) return;
+
+  ensureUserMemory(session.userId);
+  const mem = memoryMap[session.userId];
+  const now = Date.now();
+  const lastUpdate = mem.lastMemoryUpdateAt ? new Date(mem.lastMemoryUpdateAt).getTime() : 0;
+  if (now - lastUpdate < MEMORY_UPDATE_TTL_MS) {
+    logLine(config, `Memory update skipped for ${session.userId} (TTL not met)`);
+    return;
+  }
+
   const windowMsgs = messageWindows[session.id] || [];
   const summaryInput = windowMsgs.map(m => {
     const label = m.direction === "in" ? "用户" : "Bot";
@@ -1465,6 +1477,7 @@ async function updateMemoryOnSessionClose(
     mem.stats.totalInteractions += session.messageCount;
     mem.stats.lastSeenAt = new Date().toISOString();
     mem.updatedAt = new Date().toISOString();
+    mem.lastMemoryUpdateAt = new Date().toISOString();
     memoryDigestCache[session.userId] = computeMemoryHash(session.userId);
     saveMemory(config.memoryPath);
     saveMemoryDigest(config.memoryDigestPath);

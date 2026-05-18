@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import * as platform from "./platform";
@@ -9,7 +9,6 @@ const CLAUDE_DIR = join(PROJECT_ROOT, ".claude");
 const STATE_PATH = join(CLAUDE_DIR, "wechat-auto-state.json");
 const PENDING_PATH = join(CLAUDE_DIR, "wechat-auto-pending.jsonl");
 const HISTORY_PATH = join(CLAUDE_DIR, "chat-history.jsonl");
-const CURSOR_PATH = join(CLAUDE_DIR, "wechat-auto-cursor.txt");
 const PID_PATH = join(CLAUDE_DIR, "wechat-auto.pid");
 
 const PORT = parseInt(process.env.GUI_PORT || "3456", 10);
@@ -20,10 +19,14 @@ const STOP_SCRIPT = join(CLAUDE_DIR, "hooks", "stop-wechat-auto" + platform.shel
 const START_SCRIPT = join(CLAUDE_DIR, "hooks", "start-wechat-auto" + platform.shellScriptExt());
 
 function psRun(script: string, args: string[] = []): { stdout: string; stderr: string; exitCode: number } {
+  const isTs = script.endsWith(".ts");
+  const runner = isTs ? "bun" : platform.shellRunner();
+  const sArgs = isTs ? ["run"] : platform.shellArgs();
+
   const result = spawnSync(
-    platform.shellRunner(),
+    runner,
     [
-      ...platform.shellArgs(),
+      ...sArgs,
       script,
       ...args,
     ],
@@ -370,6 +373,57 @@ async function handleRequest(req: Request): Promise<Response> {
       writeFileSync(PENDING_PATH, content, "utf-8");
     } catch {}
     return jsonResponse({ success: true, message: `已拒绝 ${targetId}` });
+  }
+
+  // POST /api/send — send text message
+  if (route === "send" && method === "POST") {
+    try {
+      const body = await req.json();
+      const { to, text } = body;
+      if (!to || !text) return jsonResponse({ success: false, error: "Missing to or text" }, 400);
+
+      const result = psRun(join(PROJECT_ROOT, "wechat-send.ts"), ["--to", to, "--text", text]);
+      if (result.exitCode === 0) {
+        return jsonResponse({ success: true, message: "消息已发送" });
+      } else {
+        return jsonResponse({ success: false, error: result.stderr || "发送失败" }, 500);
+      }
+    } catch (e: any) {
+      return jsonResponse({ success: false, error: e.message }, 500);
+    }
+  }
+
+  // POST /api/send/file — send file attachment
+  if (route === "send/file" && method === "POST") {
+    try {
+      const formData = await req.formData();
+      const file = formData.get("file") as File;
+      const to = formData.get("to") as string;
+      const text = formData.get("text") as string;
+
+      if (!file || !to) return jsonResponse({ success: false, error: "Missing file or to" }, 400);
+
+      // Save temp file
+      const tempDir = join(CLAUDE_DIR, "temp-uploads");
+      if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
+      const tempPath = join(tempDir, `${Date.now()}_${file.name}`);
+      const arrayBuffer = await file.arrayBuffer();
+      writeFileSync(tempPath, Buffer.from(arrayBuffer));
+
+      const result = psRun(join(PROJECT_ROOT, "wechat-send.ts"), [
+        "--to", to,
+        "--file", tempPath,
+        "--text", text || ""
+      ]);
+
+      if (result.exitCode === 0) {
+        return jsonResponse({ success: true, message: "文件已发送" });
+      } else {
+        return jsonResponse({ success: false, error: result.stderr || "文件发送失败" }, 500);
+      }
+    } catch (e: any) {
+      return jsonResponse({ success: false, error: e.message }, 500);
+    }
   }
 
   return textResponse("Not found", 404);
