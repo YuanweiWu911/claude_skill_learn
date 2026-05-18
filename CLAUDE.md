@@ -20,6 +20,10 @@ The project uses a `platform.ts` abstraction layer to support multiple operating
 ### Linux Dependencies
 To use the system tray on Linux, install the following:
 ```bash
+# For newer Ubuntu (20.04+)
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+
+# For older Ubuntu
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1
 ```
 

@@ -9,10 +9,23 @@ from urllib.request import urlopen
 try:
     import gi
     gi.require_version('Gtk', '3.0')
-    gi.require_version('AppIndicator3', '0.1')
-    from gi.repository import Gtk, AppIndicator3, GLib
+    
+    # Try AyatanaAppIndicator3 first (newer Ubuntu)
+    try:
+        gi.require_version('AyatanaAppIndicator3', '0.1')
+        from gi.repository import AyatanaAppIndicator3 as AppIndicator
+    except (ImportError, ValueError):
+        # Fallback to AppIndicator3 (older Ubuntu)
+        try:
+            gi.require_version('AppIndicator3', '0.1')
+            from gi.repository import AppIndicator3 as AppIndicator
+        except (ImportError, ValueError):
+            print("Missing dependencies: sudo apt install gir1.2-ayatanaappindicator3-0.1 OR gir1.2-appindicator3-0.1")
+            sys.exit(1)
+            
+    from gi.repository import Gtk, GLib
 except ImportError:
-    print("Missing dependencies: sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1")
+    print("Missing dependencies: sudo apt install python3-gi gir1.2-gtk-3.0")
     sys.exit(1)
 
 class WeChatTray:
@@ -25,12 +38,12 @@ class WeChatTray:
         if not os.path.exists(icon_path):
             icon_path = "system-run" # Fallback to system icon
             
-        self.indicator = AppIndicator3.Indicator.new(
+        self.indicator = AppIndicator.Indicator.new(
             self.indicator_id,
             icon_path,
-            AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS
         )
-        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_menu(self.build_menu())
         
         # Setup polling for status updates
