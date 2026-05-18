@@ -46,8 +46,14 @@ disable-model-invocation: true
 
 ### 启动 watcher
 
+**Windows:**
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/collect-wechat.ps1" --start
+```
+
+**Linux:**
+```bash
+bash "${CLAUDE_SKILL_DIR}/collect-wechat.sh" --start
 ```
 
 - 只负责启动当前项目的后台 watcher。
@@ -55,16 +61,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/collect
 
 ### 停止 watcher
 
+**Windows:**
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/collect-wechat.ps1" --stop
+```
+
+**Linux:**
+```bash
+bash "${CLAUDE_SKILL_DIR}/collect-wechat.sh" --stop
 ```
 
 - 只负责停止当前项目的后台 watcher。
 
 ### 查看当前状态
 
+**Windows:**
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/collect-wechat.ps1"
+```
+
+**Linux:**
+```bash
+bash "${CLAUDE_SKILL_DIR}/collect-wechat.sh"
 ```
 
 - 默认不再导入 inbox。
@@ -74,16 +92,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/collect
 
 当 watcher 进入需要人工审核的场景时，可使用：
 
+**Windows:**
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/wechat-approve.ps1" list
+```
+
+**Linux:**
+```bash
+bash "${CLAUDE_SKILL_DIR}/wechat-approve.sh" list
 ```
 
 其他常用命令：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/wechat-approve.ps1" count
+# Windows
 powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/wechat-approve.ps1" approve <pending-id>
-powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/wechat-approve.ps1" reject <pending-id>
+
+# Linux
+bash "${CLAUDE_SKILL_DIR}/wechat-approve.sh" approve <pending-id>
 ```
 
 ## 行为契约

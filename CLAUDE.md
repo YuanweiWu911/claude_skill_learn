@@ -6,9 +6,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository purpose
 
-This is a personal sandbox for learning, practicing, and prototyping Claude Code custom skills. The main active project is `wechat-skill-2`, which includes a Bun-based watcher, PowerShell launch scripts, watcher-focused regression tests in `test-watcher.ts`, and a Web GUI control center (`wechat-gui-server.ts` + `wechat-skill-gui.html`).
+This is a personal sandbox for learning, practicing, and prototyping Claude Code custom skills. The main active project is `wechat-skill-2`, which includes a Bun-based watcher, PowerShell launch scripts (Windows), Bash launch scripts (Linux), watcher-focused regression tests in `test-watcher.ts`, and a Web GUI control center (`wechat-gui-server.ts` + `wechat-skill-gui.html`).
 
-Current repository status: `wechat-skill-2` is upgraded to work with `cc-weixin v0.2.1`.
+Current repository status: `wechat-skill-2` is upgraded to work with `cc-weixin v0.2.1` and supports both Windows and Linux (Ubuntu).
+
+## Platform Support
+
+The project uses a `platform.ts` abstraction layer to support multiple operating systems.
+
+- **Windows:** Uses PowerShell scripts (`.ps1`) and `wechat-tray.exe` for system tray.
+- **Linux (Ubuntu):** Uses Bash scripts (`.sh`) and `wechat-tray.py` (GTK3) for system tray.
+
+### Linux Dependencies
+To use the system tray on Linux, install the following:
+```bash
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1
+```
 
 Dependency source:
 - Install `cc-weixin v0.2.1` from Skill Market
